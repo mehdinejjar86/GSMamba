@@ -404,10 +404,12 @@ def evaluate_vimeo(
             )
             pred = padder.unpad(output['pred'])
 
-        # Clamp prediction
+        # Clamp and quantize prediction (for fair comparison - matches saved image quality)
         pred = pred.clamp(0, 1)
+        pred_np = tensor_to_numpy(pred)  # Quantize to uint8
+        pred = numpy_to_tensor(pred_np / 255.0, device)  # Back to float [0,1]
 
-        # Compute metrics
+        # Compute metrics on quantized prediction
         psnr = compute_psnr(pred, im2)
         ssim = compute_ssim(pred, im2)
         all_psnr.append(psnr)
