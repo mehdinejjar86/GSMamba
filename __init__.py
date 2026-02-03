@@ -14,7 +14,7 @@ Usage:
     python run_eval.py --checkpoint best.pth --dataset all
 """
 
-from .config import GSMambaConfig, get_config, get_full_config, FullConfig
+from config import GSMambaConfig, get_config, get_full_config, FullConfig
 
 __version__ = "0.1.0"
 __all__ = [

@@ -12,8 +12,8 @@ from typing import Optional, List, Union, Literal
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
 
-from .vimeo import VimeoTriplet, VimeoSeptuplet, vimeo_collate
-from .x4k import (
+from data.vimeo import VimeoTriplet, VimeoSeptuplet, vimeo_collate
+from data.x4k import (
     X4K1000Dataset,
     X4KTestDataset,
     X4KSequenceDataset,
@@ -23,7 +23,7 @@ from .x4k import (
     x4k_test_collate,
     x4k_sequence_collate,
 )
-from .samplers import PureBatchSampler, DistributedPureBatchSampler, CurriculumSampler
+from data.samplers import PureBatchSampler, DistributedPureBatchSampler, CurriculumSampler
 
 
 def get_dataset(

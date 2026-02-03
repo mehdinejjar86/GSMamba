@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional
 import math
 
-from ..modules.vss_block import BiMambaBlock, ConvBlock, OverlapPatchEmbed
+from modules.vss_block import BiMambaBlock, ConvBlock, OverlapPatchEmbed
 
 
 class FeatureEncoder(nn.Module):
@@ -212,7 +212,7 @@ class FeatureEncoderWithFusion(nn.Module):
         self.temporal_fusion = temporal_fusion
 
         if temporal_fusion:
-            from .temporal_fusion import TemporalFusion
+            from models.temporal_fusion import TemporalFusion
             # Create temporal fusion modules for each scale (except first conv scales)
             self.fusion_modules = nn.ModuleList([
                 TemporalFusion(dim, num_layers=1) if i >= conv_stages else None

@@ -44,17 +44,17 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 
-from .config import get_full_config, update_config_from_args, FullConfig
-from .models.gs_mamba import GSMamba, build_model
-from .losses.combined import GSMambaLoss, build_loss
-from .data import (
+from config import get_full_config, update_config_from_args, FullConfig
+from models.gs_mamba import GSMamba, build_model
+from losses.combined import GSMambaLoss, build_loss
+from data import (
     create_train_loader,
     create_eval_loader,
     get_curriculum_settings,
 )
 
 # Import evaluation functions for comprehensive validation
-from .eval import evaluate_vimeo, evaluate_x4k, evaluate_all
+from eval import evaluate_vimeo, evaluate_x4k, evaluate_all
 
 
 def setup_distributed():

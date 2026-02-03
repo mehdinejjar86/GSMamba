@@ -10,16 +10,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 
-from .photometric import L1Loss, SSIMLoss, LaplacianLoss
-from .perceptual import LPIPSLoss
-from .geometric import (
+from losses.photometric import L1Loss, SSIMLoss, LaplacianLoss
+from losses.perceptual import LPIPSLoss
+from losses.geometric import (
     DepthSmoothLoss,
     TemporalConsistencyLoss,
     OpacityRegularizationLoss,
     ScaleRegularizationLoss,
 )
-from .gaussian_flow import GaussianFlowLoss, get_gflow_weight
-from .uncertainty import UncertaintyWeighting, ProgressiveUncertaintyWeighting
+from losses.gaussian_flow import GaussianFlowLoss, get_gflow_weight
+from losses.uncertainty import UncertaintyWeighting, ProgressiveUncertaintyWeighting
 
 
 class GSMambaLoss(nn.Module):
@@ -208,7 +208,7 @@ class GSMambaLoss(nn.Module):
         recon_loss = torch.tensor(0.0, device=device)
         if len(gaussians_list) > 0:
             # Import renderer (avoid circular import)
-            from ..models.renderer import GaussianRenderer
+            from models.renderer import GaussianRenderer
             renderer = GaussianRenderer(image_size=(H, W))
 
             for i, gaussians in enumerate(gaussians_list):

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Union
 import math
 
-from ..modules.temporal_ssm import TemporalSSMBlock, TemporalPositionEncoding
+from modules.temporal_ssm import TemporalSSMBlock, TemporalPositionEncoding
 
 
 class GaussianInterpolator(nn.Module):

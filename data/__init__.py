@@ -12,8 +12,8 @@ Output format for all dataloaders:
     target: [B, 3, H, W] - ground truth frame at target_time
 """
 
-from .vimeo import VimeoTriplet, VimeoSeptuplet, vimeo_collate
-from .x4k import (
+from data.vimeo import VimeoTriplet, VimeoSeptuplet, vimeo_collate
+from data.x4k import (
     X4K1000Dataset,
     X4KTestDataset,
     X4KSequenceDataset,
@@ -23,8 +23,8 @@ from .x4k import (
     x4k_test_collate,
     x4k_sequence_collate,
 )
-from .samplers import PureBatchSampler, DistributedPureBatchSampler
-from .utils import create_train_loader, create_eval_loader, get_dataset
+from data.samplers import PureBatchSampler, DistributedPureBatchSampler
+from data.utils import create_train_loader, create_eval_loader, get_dataset
 
 __all__ = [
     # Vimeo

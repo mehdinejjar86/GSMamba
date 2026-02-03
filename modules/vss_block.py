@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Callable, Optional
 
-from .ss2d import SS2D
+from modules.ss2d import SS2D
 
 
 class ChannelAttention(nn.Module):

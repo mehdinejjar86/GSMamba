@@ -15,13 +15,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Union
 
-from ..config import GSMambaConfig
-from .feature_encoder import FeatureEncoder
-from .temporal_fusion import MultiScaleTemporalFusion, TemporalFusion
-from .gaussian_head import GaussianHead, GaussianAssembler, MultiScaleGaussianHead
-from .gaussian_interpolator import GaussianInterpolator
-from .renderer import GaussianRenderer
-from .refine import UNetRefine
+from config import GSMambaConfig
+from models.feature_encoder import FeatureEncoder
+from models.temporal_fusion import MultiScaleTemporalFusion, TemporalFusion
+from models.gaussian_head import GaussianHead, GaussianAssembler, MultiScaleGaussianHead
+from models.gaussian_interpolator import GaussianInterpolator
+from models.renderer import GaussianRenderer
+from models.refine import UNetRefine
 
 
 class GSMamba(nn.Module):
@@ -366,6 +366,6 @@ def build_model(config_name: str = "gsmamba") -> GSMamba:
     Returns:
         GSMamba model instance
     """
-    from ..config import get_config
+    from config import get_config
     config = get_config(config_name)
     return GSMamba(config)

@@ -44,8 +44,8 @@ torch.set_grad_enabled(False)
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 
-from .models.gs_mamba import GSMamba, build_model
-from .config import get_config, get_full_config
+from models.gs_mamba import GSMamba, build_model
+from config import get_config, get_full_config
 
 
 # ==============================================================================

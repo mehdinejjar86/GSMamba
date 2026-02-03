@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple
 import math
 
-from ..modules.temporal_ssm import TemporalSSMBlock, TemporalPositionEncoding
+from modules.temporal_ssm import TemporalSSMBlock, TemporalPositionEncoding
 
 
 class TemporalFusion(nn.Module):
