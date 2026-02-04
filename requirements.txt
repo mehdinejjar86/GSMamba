@@ -1,0 +1,48 @@
+# GS-Mamba Requirements
+# Install with: pip install -r requirements.txt
+
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Mamba SSM (highly recommended for performance)
+# Install separately: pip install mamba-ssm
+# Requires: CUDA 11.6+ and PyTorch 2.0+
+# mamba-ssm>=1.2.0
+
+# Gaussian Splatting Renderer (highly recommended)
+# Install from source:
+#   git clone https://github.com/graphdeco-inria/diff-gaussian-rasterization
+#   cd diff-gaussian-rasterization && pip install .
+# Or: pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
+
+# Image/Video Processing
+numpy>=1.21.0
+opencv-python>=4.5.0
+Pillow>=9.0.0
+
+# Metrics and Losses
+lpips>=0.1.4
+pytorch-msssim>=1.0.0
+
+# Utilities
+einops>=0.6.0
+tqdm>=4.64.0
+tensorboard>=2.10.0
+
+# Configuration
+PyYAML>=6.0
+
+# Optional: Flow estimation (for Gaussian Flow loss)
+# timm>=0.9.0
+
+# Optional: Visualization
+matplotlib>=3.5.0
+
+# Optional: Distributed training utilities
+# deepspeed>=0.9.0
+
+# Development (optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0

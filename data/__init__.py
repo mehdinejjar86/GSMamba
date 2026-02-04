@@ -24,7 +24,7 @@ from data.x4k import (
     x4k_sequence_collate,
 )
 from data.samplers import PureBatchSampler, DistributedPureBatchSampler
-from data.utils import create_train_loader, create_eval_loader, get_dataset
+from data.utils import create_train_loader, create_eval_loader, get_dataset, get_curriculum_settings
 
 __all__ = [
     # Vimeo
@@ -47,4 +47,5 @@ __all__ = [
     "create_train_loader",
     "create_eval_loader",
     "get_dataset",
+    "get_curriculum_settings",
 ]
