@@ -302,6 +302,8 @@ def update_config_from_args(config: FullConfig, args) -> FullConfig:
         config.train.batch_size = args.batch_size
     if hasattr(args, 'crop_size') and args.crop_size:
         config.data.crop_size = args.crop_size
+    if hasattr(args, 'x4k_crop_size') and args.x4k_crop_size:
+        config.data.x4k_crop_size = args.x4k_crop_size
     if hasattr(args, 'num_workers') and args.num_workers:
         config.data.num_workers = args.num_workers
 

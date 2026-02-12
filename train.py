@@ -511,6 +511,8 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--x4k_crop_size', type=int, default=None,
+                        help='Crop size for X4K training samples (overrides config.data.x4k_crop_size).')
 
     args = parser.parse_args()
 
