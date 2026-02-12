@@ -200,12 +200,14 @@ class GSMambaLoss(nn.Module):
         # ========== Perceptual Loss ==========
         # Note: LPIPS is handled separately (not in uncertainty weighting)
         # as it conflicts with PSNR/SSIM optimization
-        lpips_loss = torch.tensor(0.0, device=device)
+        # lpips_loss = torch.tensor(0.0, device=device)
+        lpips_loss = pred.new_zeros(()) # instead of torch.tensor(0.0, device=device)
         if self.use_lpips and self.lpips_loss is not None:
             lpips_loss = self.w_lpips * self.lpips_loss(pred, target)
 
         # ========== Reconstruction Loss ==========
-        recon_loss = torch.tensor(0.0, device=device)
+        # recon_loss = torch.tensor(0.0, device=device)
+        recon_loss = pred.new_zeros(()) # instead of torch.tensor(0.0, device=device)
         if len(gaussians_list) > 0:
             # Import renderer (avoid circular import)
             from models.renderer import GaussianRenderer
@@ -224,11 +226,12 @@ class GSMambaLoss(nn.Module):
         raw_losses['depth'] = self.depth_loss(depth, pred)
         raw_losses['temporal'] = self.temporal_loss(
             gaussians_list, gaussians_interp, t
-        ) if len(gaussians_list) > 0 else torch.tensor(0.0, device=device)
+        ) if len(gaussians_list) > 0 else pred.new_zeros(())
 
         # ========== Gaussian Flow Loss ==========
         # Note: gflow has its own decay schedule, compute raw loss here
-        gflow_loss = torch.tensor(0.0, device=device)
+        gflow_loss = pred.new_zeros(()) # instead of torch.tensor(0.0, device=device)
+
         if self.use_gflow and self.gflow_loss is not None and len(gaussians_list) >= 2:
             gflow_loss = self.gflow_loss(
                 gaussians_list[0],
@@ -246,8 +249,8 @@ class GSMambaLoss(nn.Module):
             all_scales = torch.cat([g['scale'] for g in gaussians_list], dim=1)
             raw_losses['scale_reg'] = self.scale_reg(all_scales)
         else:
-            raw_losses['opacity_reg'] = torch.tensor(0.0, device=device)
-            raw_losses['scale_reg'] = torch.tensor(0.0, device=device)
+            raw_losses['opacity_reg'] = pred.new_zeros(())
+            raw_losses['scale_reg'] = pred.new_zeros(())
 
         # ========== Apply Weighting ==========
         if self.use_uncertainty_weighting and self.uncertainty is not None:

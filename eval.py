@@ -40,7 +40,7 @@ from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
 from torchvision.utils import save_image
 
-torch.set_grad_enabled(False)
+# torch.set_grad_enabled(False)
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 

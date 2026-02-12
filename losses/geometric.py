@@ -96,7 +96,8 @@ class TemporalConsistencyLoss(nn.Module):
         N = len(gaussians_list)
 
         if N < 2:
-            return torch.tensor(0.0, device=gaussians_interp['xyz'].device)
+            return gaussians_interp['xyz'].new_zeros(())  # Maintains gradient chain
+
 
         # Find bounding frames
         idx0 = int(t * (N - 1))
@@ -149,7 +150,7 @@ class MultiViewConsistencyLoss(nn.Module):
         N = len(gaussians_list)
 
         if N < 2:
-            return torch.tensor(0.0, device=gaussians_list[0]['xyz'].device)
+            return gaussians_list[0]['xyz'].new_zeros(())  # Maintains gradient chain
 
         loss = 0.0
         count = 0

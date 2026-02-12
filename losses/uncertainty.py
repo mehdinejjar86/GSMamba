@@ -91,8 +91,8 @@ class UncertaintyWeighting(nn.Module):
             total_loss: Sum of uncertainty-weighted losses
             weighted_losses: Dict of {loss_name: weighted_loss_value}
         """
-        device = next(iter(losses.values())).device
-        total = torch.tensor(0.0, device=device)
+        first_loss = next(iter(losses.values()))
+        total = first_loss.new_zeros(())  # Maintains gradient chain
         weighted = {}
 
         for name, loss in losses.items():
@@ -226,8 +226,8 @@ class ProgressiveUncertaintyWeighting(UncertaintyWeighting):
         losses: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Apply fixed weights during warmup."""
-        device = next(iter(losses.values())).device
-        total = torch.tensor(0.0, device=device)
+        first_loss = next(iter(losses.values()))
+        total = first_loss.new_zeros(())  # Maintains gradient chain
         weighted = {}
 
         for name, loss in losses.items():

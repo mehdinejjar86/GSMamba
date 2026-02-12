@@ -28,7 +28,7 @@ class DataConfig:
     x4k_test_root: str = "./datasets/x4k/test"
     x4k_steps: List[int] = field(default_factory=lambda: [5, 31, 31])  # Motion magnitudes
     x4k_n_frames: List[int] = field(default_factory=lambda: [4, 3, 2])  # PAIRED - Variable N per step
-    x4k_crop_size: Optional[int] = None  # X4K train is already 768x768 (no crop needed), test is 2K/4K
+    x4k_crop_size: Optional[int] = 256  # X4K train is already 768x768 (no crop needed), test is 2K/4K
     x4k_target_indices: List[int] = field(default_factory=lambda: [16])  # For test (2x)
     x4k_scale: str = "4k"  # "4k" or "2k" for test
 
@@ -150,7 +150,7 @@ class LossConfig:
     # Gaussian Flow (faster decay for pure 3D learning)
     w_gflow_max: float = 0.05  # DECREASED from 0.1
     gflow_decay_fraction: float = 0.3  # Decay to 0 over this fraction of training
-    use_gflow: bool = True
+    use_gflow: bool = False
 
     # Regularization (minimal)
     w_opacity_reg: float = 0.001  # DECREASED from 0.01
@@ -170,7 +170,7 @@ class GSMambaConfig:
 
     # Input configuration
     max_n_frames: int = 7  # Maximum number of input frames
-    image_size: Tuple[int, int] = (512, 512)
+    image_size: Tuple[int, int] = (256, 256)
 
     # Feature encoder (SS2D backbone)
     embed_dims: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512])

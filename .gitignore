@@ -1,2 +1,6 @@
 *__pycache__*
-*.log
+*.log.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+gs_logs/
+outputs/
+gaussian-splatting/

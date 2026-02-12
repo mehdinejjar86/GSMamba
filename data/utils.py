@@ -261,7 +261,7 @@ def create_eval_loader(
             root=getattr(data_cfg, 'vimeo_root', './datasets/vimeo_triplet'),
             split=split,
             mode="interp",  # Always interpolation for eval
-            crop_size=None,  # No crop for eval
+            crop_size=getattr(data_cfg, 'crop_size', 256),
             aug_flip=False,
             aug_reverse=False,
         )

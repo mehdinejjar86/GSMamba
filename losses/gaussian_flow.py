@@ -279,7 +279,7 @@ class GaussianFlowLossWithSchedule(nn.Module):
         )
 
         if weight < 1e-6:
-            return torch.tensor(0.0, device=img0.device), 0.0
+            return img0.new_zeros(()), 0.0  # Maintains gradient chain
 
         loss = self.gflow_loss(gaussians_0, gaussians_1, img0, img1, use_precomputed_flow)
 
