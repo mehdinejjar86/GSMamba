@@ -22,7 +22,7 @@ torchrun --nproc_per_node=8 train.py \
     --x4k-n-frames 4 3 2 \
     --crop_size 256 \
     --image_size 256 256 \
-    --batch_size 8 \
+    --batch_size 4 \
     --epochs 300 \
     --lr 2e-4 \
     --no_amp \

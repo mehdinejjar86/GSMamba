@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=100G
 #SBATCH --gres=gpu:a40:1
-#SBATCH --time=4:00:00
+#SBATCH --time=24:00:00
 
 mkdir -p gs_logs
 
@@ -23,7 +23,7 @@ python train.py \
     --crop_size 256 \
     --x4k_crop_size 256 \
     --image_size 256 256 \
-    --batch_size 8 \
+    --batch_size 4 \
     --epochs 10 \
     --lr 2e-4 \
     --no_amp \
