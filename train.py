@@ -121,33 +121,45 @@ def get_optimizer(model: nn.Module, config: FullConfig) -> torch.optim.Optimizer
     return optimizer
 
 
-def get_scheduler(optimizer, config: FullConfig, steps_per_epoch: int):
-    """Create learning rate scheduler."""
-    total_steps = config.train.epochs * steps_per_epoch
-    warmup_steps = config.train.warmup_epochs * steps_per_epoch
+def get_scheduler(optimizer, config: FullConfig):
+    """
+    Create learning rate scheduler.
+
+    Uses epoch-based scheduling to remain stable when curriculum/mixed training
+    changes dataloader length across epochs.
+    """
+    total_epochs = max(int(config.train.epochs), 1)
+    warmup_epochs = max(0, min(int(config.train.warmup_epochs), total_epochs))
 
     if config.train.scheduler == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-        warmup = LinearLR(
-            optimizer,
-            start_factor=0.01,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        cosine = CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps - warmup_steps,
-            eta_min=config.train.min_lr,
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup, cosine],
-            milestones=[warmup_steps],
-        )
+        if warmup_epochs > 0:
+            warmup = LinearLR(
+                optimizer,
+                start_factor=0.01,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine = CosineAnnealingLR(
+                optimizer,
+                T_max=max(total_epochs - warmup_epochs, 1),
+                eta_min=config.train.min_lr,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs,
+                eta_min=config.train.min_lr,
+            )
     elif config.train.scheduler == "step":
         from torch.optim.lr_scheduler import StepLR
-        scheduler = StepLR(optimizer, step_size=30 * steps_per_epoch, gamma=0.5)
+        scheduler = StepLR(optimizer, step_size=30, gamma=0.5)
     else:
         scheduler = None
 
@@ -220,9 +232,6 @@ def train_one_epoch(
 
         scaler.step(optimizer)
         scaler.update()
-
-        if scheduler is not None:
-            scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -632,7 +641,7 @@ def main():
         x4k_n_frames=config.data.x4k_n_frames if not args.use_curriculum else None,
     )
 
-    scheduler = get_scheduler(optimizer, config, len(train_loader))
+    scheduler = get_scheduler(optimizer, config)
     scaler = GradScaler(enabled=config.train.use_amp)
 
     # Create eval dataloader
@@ -717,6 +726,9 @@ def main():
             model, criterion, train_loader, optimizer, scheduler, scaler,
             epoch, config, writer, rank, world_size
         )
+
+        if scheduler is not None:
+            scheduler.step()
 
         if is_main:
             print(f"Epoch {epoch} completed. Train Loss: {train_loss:.4f}")

@@ -121,6 +121,13 @@ class GSMamba(nn.Module):
         """
         B, N, C, H, W = frames.shape
         device = frames.device
+        expected_h, expected_w = self.config.image_size
+        if (H, W) != (expected_h, expected_w):
+            raise ValueError(
+                f"Input frame size {(H, W)} does not match model.image_size "
+                f"{(expected_h, expected_w)}. Update config.model.image_size "
+                f"(or pass --image_size) to match your training crop/resolution."
+            )
 
         # Default timestamps: uniform spacing
         if timestamps is None:

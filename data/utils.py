@@ -383,7 +383,7 @@ def get_curriculum_settings(config, epoch: int) -> dict:
         Stage 1 (10-25%): X4K N=4 only (small motion)
         Stage 2 (25-40%): X4K N=3 (medium motion)
         Stage 3 (40-55%): X4K N=2 (large motion)
-        Stage 4 (55%+): Full mixed training
+        Stage 4 (55%+): Mixed training (Vimeo + X4K)
 
     Args:
         config: Configuration with train.epochs
@@ -397,10 +397,10 @@ def get_curriculum_settings(config, epoch: int) -> dict:
 
     # Curriculum phases (percentage of training)
     curriculum_fraction = getattr(train_cfg, 'curriculum_fraction', 0.55)
-    curriculum_epochs = int(total_epochs * curriculum_fraction)
+    curriculum_epochs = max(1, int(total_epochs * curriculum_fraction))
 
     # Stage boundaries
-    stage_len = curriculum_epochs // 5
+    stage_len = max(1, curriculum_epochs // 5)
 
     if epoch >= curriculum_epochs:
         # Full mixed training
@@ -437,9 +437,9 @@ def get_curriculum_settings(config, epoch: int) -> dict:
             'x4k_n_frames': [2],
         }
     else:
-        # Stage 4: Mixed X4K
+        # Stage 4: Mixed training (Vimeo + X4K)
         return {
-            'mode': 'x4k_only',
+            'mode': 'mixed',
             'x4k_steps': [5, 31, 31],
             'x4k_n_frames': [4, 3, 2],
         }
