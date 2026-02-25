@@ -43,6 +43,7 @@ class PureBatchSampler(Sampler):
         ratios: List[float],
         shuffle: bool = True,
         drop_last: bool = True,
+        full_coverage: bool = False,
     ):
         """
         Args:
@@ -51,6 +52,7 @@ class PureBatchSampler(Sampler):
             ratios: Proportion of batches from each dataset (must sum to 1.0)
             shuffle: Shuffle samples within each dataset
             drop_last: Drop incomplete batches
+            full_coverage: Use all available batches from each dataset (ignore ratio truncation)
         """
         assert len(dataset_sizes) == len(ratios), "Sizes and ratios must match"
         assert abs(sum(ratios) - 1.0) < 1e-6, f"Ratios must sum to 1.0, got {sum(ratios)}"
@@ -60,6 +62,7 @@ class PureBatchSampler(Sampler):
         self.ratios = ratios
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.full_coverage = full_coverage
 
         # Cumulative offsets for ConcatDataset indexing
         self.offsets = [0]
@@ -72,15 +75,18 @@ class PureBatchSampler(Sampler):
             num_batches = size // batch_size if drop_last else math.ceil(size / batch_size)
             self.batches_per_dataset.append(num_batches)
 
-        # Total batches based on ratios
-        total_batches = min(
-            int(num_batches / ratio) if ratio > 0 else float('inf')
-            for num_batches, ratio in zip(self.batches_per_dataset, ratios)
-        )
-        self.total_batches = total_batches
-
-        # Actual batches per dataset
-        self.actual_batches = [int(total_batches * ratio) for ratio in ratios]
+        if self.full_coverage:
+            # Use every available batch from every dataset.
+            self.total_batches = sum(self.batches_per_dataset)
+            self.actual_batches = self.batches_per_dataset.copy()
+        else:
+            # Ratio-constrained mixed sampling (may truncate larger datasets).
+            total_batches = min(
+                int(num_batches / ratio) if ratio > 0 else float('inf')
+                for num_batches, ratio in zip(self.batches_per_dataset, ratios)
+            )
+            self.total_batches = total_batches
+            self.actual_batches = [int(total_batches * ratio) for ratio in ratios]
 
     def __iter__(self) -> Iterator[List[int]]:
         """Generate batches with deterministic dataset assignment."""
@@ -160,6 +166,7 @@ class DistributedPureBatchSampler(Sampler):
         shuffle: bool = True,
         drop_last: bool = True,
         seed: int = 0,
+        full_coverage: bool = False,
     ):
         """
         Args:
@@ -171,6 +178,7 @@ class DistributedPureBatchSampler(Sampler):
             shuffle: Shuffle samples
             drop_last: Drop incomplete batches
             seed: Random seed for reproducibility
+            full_coverage: Use all available batches from each dataset (ignore ratio truncation)
         """
         import torch.distributed as dist
 
@@ -197,6 +205,7 @@ class DistributedPureBatchSampler(Sampler):
         self.drop_last = drop_last
         self.seed = seed
         self.epoch = 0
+        self.full_coverage = full_coverage
 
         # Cumulative offsets for ConcatDataset
         self.offsets = [0]
@@ -209,19 +218,23 @@ class DistributedPureBatchSampler(Sampler):
             num_batches = size // batch_size if drop_last else math.ceil(size / batch_size)
             self.global_batches.append(num_batches)
 
-        # Total global batches based on ratios
-        total_global_batches = min(
-            int(num_batches / ratio) if ratio > 0 else float('inf')
-            for num_batches, ratio in zip(self.global_batches, ratios)
-        )
+        if self.full_coverage:
+            # Use every available batch from every dataset before replica split.
+            self.global_actual_batches = self.global_batches.copy()
+        else:
+            # Ratio-constrained mixed sampling (may truncate larger datasets).
+            total_global_batches = min(
+                int(num_batches / ratio) if ratio > 0 else float('inf')
+                for num_batches, ratio in zip(self.global_batches, ratios)
+            )
+            self.global_actual_batches = [int(total_global_batches * ratio) for ratio in ratios]
+
+        total_global_batches = sum(self.global_actual_batches)
 
         # Batches per replica (per GPU)
         self.batches_per_replica = total_global_batches // num_replicas
         if not drop_last and total_global_batches % num_replicas != 0:
             self.batches_per_replica += 1
-
-        # Actual batches per dataset per replica
-        self.actual_batches = [int(self.batches_per_replica * ratio) for ratio in ratios]
 
     def __iter__(self) -> Iterator[List[int]]:
         """Generate batches for this replica."""
@@ -243,13 +256,15 @@ class DistributedPureBatchSampler(Sampler):
         # Create all batches for each dataset
         all_batches = []
         for dataset_idx, (indices, num_batches) in enumerate(
-            zip(dataset_indices, self.actual_batches)
+            zip(dataset_indices, self.global_actual_batches)
         ):
-            # Create batches (total across all replicas)
-            for batch_idx in range(num_batches * self.num_replicas):
+            # Create global batches before distributing across replicas.
+            for batch_idx in range(num_batches):
                 start = batch_idx * self.batch_size
                 end = start + self.batch_size
 
+                if start >= len(indices):
+                    break
                 if end <= len(indices):
                     batch = indices[start:end]
                     all_batches.append((dataset_idx, batch))
@@ -262,15 +277,24 @@ class DistributedPureBatchSampler(Sampler):
             random.seed(self.seed + self.epoch)
             random.shuffle(all_batches)
 
+        # Ensure equal number of batches for each replica.
+        total_size = self.batches_per_replica * self.num_replicas
+        if len(all_batches) > total_size:
+            all_batches = all_batches[:total_size]
+        elif len(all_batches) < total_size and not self.drop_last and len(all_batches) > 0:
+            pad = total_size - len(all_batches)
+            repeats = math.ceil(pad / len(all_batches))
+            all_batches.extend((all_batches * repeats)[:pad])
+
         # Select batches for this replica
-        batches_for_rank = all_batches[self.rank::self.num_replicas]
+        batches_for_rank = all_batches[self.rank:total_size:self.num_replicas]
 
         # Yield batches
         for _, batch in batches_for_rank:
             yield batch
 
     def __len__(self) -> int:
-        return sum(self.actual_batches)
+        return self.batches_per_replica
 
     def set_epoch(self, epoch: int):
         """Set epoch for shuffling. Call at start of each epoch."""

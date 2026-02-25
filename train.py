@@ -205,7 +205,7 @@ def train_one_epoch(
                 input_frames=frames,
                 gaussians_list=output.get('all_gaussians', []),
                 gaussians_interp=output.get('gaussians', {}),
-                t=target_time.mean().item(),
+                t=target_time,
             )
 
             loss = losses['total']
@@ -284,6 +284,7 @@ def evaluate(
     total_loss = 0.0
     total_psnr = 0.0
     num_batches = 0
+    total_samples = 0
     samples_saved = False
 
     for batch in dataloader:
@@ -312,6 +313,7 @@ def evaluate(
         loss = nn.functional.l1_loss(pred, target)
         total_loss += loss.item()
         num_batches += 1
+        total_samples += frames.shape[0]
 
         # Save sample images to disk (like SPACE)
         if save_samples and not samples_saved and rank == 0 and samples_dir is not None:
@@ -328,7 +330,7 @@ def evaluate(
             samples_saved = True
 
     avg_loss = total_loss / num_batches
-    avg_psnr = total_psnr / (num_batches * frames.shape[0])
+    avg_psnr = total_psnr / total_samples
 
     if rank == 0:
         print(f"Eval Epoch {epoch}: Loss={avg_loss:.4f}, PSNR={avg_psnr:.2f}dB")
@@ -487,6 +489,18 @@ def main():
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--crop_size', type=int, default=None)
     parser.add_argument('--num_workers', type=int, default=None)
+    parser.add_argument('--full-coverage-mixed', dest='full_coverage_mixed',
+                        action='store_true', default=None,
+                        help='Use all available mixed-dataset batches (disable ratio truncation).')
+    parser.add_argument('--no-full-coverage-mixed', dest='full_coverage_mixed',
+                        action='store_false',
+                        help='Use ratio-constrained mixed sampling (may truncate larger datasets).')
+    parser.add_argument('--drop-last-mixed', dest='drop_last_mixed',
+                        action='store_true', default=None,
+                        help='Drop incomplete mixed-mode batches.')
+    parser.add_argument('--keep-tail-mixed', dest='drop_last_mixed',
+                        action='store_false',
+                        help='Keep incomplete mixed-mode batches.')
     parser.add_argument('--mode', type=str, default='vimeo_only',
                         choices=['vimeo_only', 'x4k_only', 'mixed'])
 
@@ -505,6 +519,12 @@ def main():
     parser.add_argument('--no_amp', dest='use_amp', action='store_false')
     parser.add_argument('--use_curriculum', action='store_true', default=True)
     parser.add_argument('--no_curriculum', dest='use_curriculum', action='store_false')
+
+    # Flow supervision
+    parser.add_argument('--flow_ckpt', type=str, default=None,
+                        help='Path to VFIMamba checkpoint for Gaussian Flow Loss')
+    parser.add_argument('--flow_model_size', type=str, default='S', choices=['S', 'L'],
+                        help='VFIMamba model size: S (F=16) or L (F=32)')
 
     # Experiment
     parser.add_argument('--exp_name', type=str, default=None)
@@ -535,8 +555,8 @@ def main():
     # Set seed
     set_seed(config.seed + rank, config.deterministic)
 
-    # Create model
-    model = build_model(args.model)
+    # Create model (use updated model config from full config)
+    model = GSMamba(config.model)
     model = model.cuda()
 
     if is_main:
@@ -550,13 +570,53 @@ def main():
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank])
 
+    # Load VFIMamba flow network for Gaussian Flow Loss (if checkpoint provided)
+    flow_net = None
+    if args.flow_ckpt:
+        from losses.flow_net_loader import load_vfimamba_flow_net
+        flow_net = load_vfimamba_flow_net(
+            ckpt_path=args.flow_ckpt,
+            model_size=args.flow_model_size,
+            device=f"cuda:{local_rank}" if world_size > 1 else "cuda",
+        )
+        if is_main:
+            print(f"Gaussian Flow supervision enabled with VFIMamba-{args.flow_model_size}")
+
     # Create loss function with uncertainty-based weighting
-    criterion = build_loss(config.loss, config.model)
+    criterion = build_loss(config.loss, config.model, flow_net=flow_net)
     criterion = criterion.cuda()
+
+    # Guided-flow policy:
+    # Enable only for Vimeo midpoint interpolation phase (mode=vimeo_only + vimeo_mode=interp).
+    # Disable automatically for X4K/mixed phases.
+    flow_policy_enabled = bool(config.loss.use_gflow and flow_net is not None)
+    vimeo_mode = getattr(config.data, 'vimeo_mode', 'interp')
+    vimeo_midpoint_only = (vimeo_mode == 'interp')
+    initial_mode = 'vimeo_only' if args.use_curriculum else args.mode
+
+    if flow_policy_enabled:
+        criterion.use_gflow = (initial_mode == 'vimeo_only' and vimeo_midpoint_only)
+    else:
+        criterion.use_gflow = False
 
     if is_main:
         print(f"Loss config: uncertainty_weighting={config.loss.use_uncertainty_weighting}, "
               f"warmup_epochs={config.loss.uncertainty_warmup_epochs}")
+        if config.loss.use_gflow and flow_net is None:
+            print("Warning: Gaussian Flow guidance is disabled because no flow_net was provided.")
+            print("         Set loss.use_gflow=False, or pass a pretrained flow network into build_loss().")
+        elif flow_policy_enabled:
+            print(
+                "Gaussian Flow policy: enabled only for Vimeo midpoint interpolation "
+                "(mode=vimeo_only, vimeo_mode=interp), disabled otherwise."
+            )
+            if not vimeo_midpoint_only:
+                print(
+                    f"Warning: vimeo_mode={vimeo_mode!r}, so Gaussian Flow starts disabled "
+                    "because midpoint-only supervision is required."
+                )
+
+    prev_use_gflow = criterion.use_gflow
 
     # Create optimizer and scheduler
     optimizer = get_optimizer(model, config)
@@ -610,6 +670,8 @@ def main():
         print(f"Curriculum: {'enabled' if args.use_curriculum else 'disabled'}")
         print(f"X4K steps: {config.data.x4k_steps}")
         print(f"X4K n_frames: {config.data.x4k_n_frames}")
+        print(f"Mixed full coverage: {config.data.full_coverage_mixed}")
+        print(f"Mixed drop_last: {config.data.drop_last_mixed}")
         if not args.use_curriculum and args.mode in ['x4k_only', 'mixed']:
             print(f"  -> TEMPO-style: {list(zip(config.data.x4k_steps, config.data.x4k_n_frames))}")
 
@@ -628,6 +690,21 @@ def main():
                 x4k_steps=curriculum.get('x4k_steps'),
                 x4k_n_frames=curriculum.get('x4k_n_frames'),
             )
+            current_mode = curriculum.get('mode', 'vimeo_only')
+        else:
+            current_mode = args.mode
+
+        # Toggle guided-flow supervision by training phase/mode.
+        if flow_policy_enabled:
+            should_use_gflow = (current_mode == 'vimeo_only' and vimeo_midpoint_only)
+            criterion.use_gflow = should_use_gflow
+            if is_main and criterion.use_gflow != prev_use_gflow:
+                state = "enabled" if criterion.use_gflow else "disabled"
+                print(
+                    f"Epoch {epoch}: Gaussian Flow guidance {state} "
+                    f"(mode={current_mode}, vimeo_mode={vimeo_mode})."
+                )
+            prev_use_gflow = criterion.use_gflow
 
         # Set epoch for distributed sampler
         if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):

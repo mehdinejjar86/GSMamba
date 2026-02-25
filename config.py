@@ -39,7 +39,13 @@ class DataConfig:
 
     # Mixed training
     use_mixed_training: bool = False
-    dataset_ratios: List[float] = field(default_factory=lambda: [0.7, 0.3])  # [Vimeo, X4K]
+    # Mixed-mode ratios:
+    #   - Legacy: [vimeo, x4k]
+    #   - Explicit split-by-N: [vimeo, x4k_n1, x4k_n2, ...]
+    dataset_ratios: List[float] = field(default_factory=lambda: [0.7, 0.3])
+    # Mixed-mode sampling behavior
+    full_coverage_mixed: bool = True  # Use all mixed-dataset batches (ignore ratio truncation)
+    drop_last_mixed: bool = False     # Keep tail batches in mixed mode to maximize sample usage
 
     # Augmentation
     aug_flip: bool = True
@@ -304,6 +310,10 @@ def update_config_from_args(config: FullConfig, args) -> FullConfig:
         config.data.crop_size = args.crop_size
     if hasattr(args, 'num_workers') and args.num_workers:
         config.data.num_workers = args.num_workers
+    if hasattr(args, 'full_coverage_mixed') and args.full_coverage_mixed is not None:
+        config.data.full_coverage_mixed = args.full_coverage_mixed
+    if hasattr(args, 'drop_last_mixed') and args.drop_last_mixed is not None:
+        config.data.drop_last_mixed = args.drop_last_mixed
 
     # Update X4K TEMPO-style step/n_frames configuration
     # Note: argparse converts dashes to underscores (x4k-steps -> x4k_steps)

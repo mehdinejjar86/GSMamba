@@ -196,8 +196,8 @@ class GaussianRenderer(nn.Module):
         except:
             pass
 
-        # Scale: apply exp activation
-        scales = torch.exp(gaussians['scale'])  # (N, 3)
+        # Scale: already positive from softplus in GaussianHead
+        scales = gaussians['scale']  # (N, 3)
 
         # Rotation: convert angle to quaternion
         rotations = rotation_to_quaternion(gaussians['rotation'])  # (N, 4)

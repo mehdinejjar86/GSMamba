@@ -7,7 +7,7 @@ Depth smoothness, temporal consistency, and other geometric constraints.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 
 class DepthSmoothLoss(nn.Module):
@@ -77,7 +77,7 @@ class TemporalConsistencyLoss(nn.Module):
             self,
             gaussians_list: List[Dict[str, torch.Tensor]],
             gaussians_interp: Dict[str, torch.Tensor],
-            t: float,
+            t: Union[float, torch.Tensor],
     ) -> torch.Tensor:
         """
         Compute temporal consistency loss.
@@ -88,7 +88,7 @@ class TemporalConsistencyLoss(nn.Module):
         Args:
             gaussians_list: List of Gaussian dicts for each input frame
             gaussians_interp: Interpolated Gaussians at timestep t
-            t: Interpolation timestep in [0, 1]
+            t: Interpolation timestep in [0, 1] (scalar or per-sample tensor [B])
 
         Returns:
             Temporal consistency loss
@@ -98,18 +98,41 @@ class TemporalConsistencyLoss(nn.Module):
         if N < 2:
             return torch.tensor(0.0, device=gaussians_interp['xyz'].device)
 
-        # Find bounding frames
-        idx0 = int(t * (N - 1))
-        idx1 = min(idx0 + 1, N - 1)
-        alpha = t * (N - 1) - idx0
+        # Convert timestep to per-sample tensor and clamp interpolation range.
+        xyz_interp = gaussians_interp['xyz']  # (B, num_points, 3)
+        B = xyz_interp.shape[0]
+        device = xyz_interp.device
+        dtype = xyz_interp.dtype
 
-        # Linear interpolation baseline
-        xyz_0 = gaussians_list[idx0]['xyz']
-        xyz_1 = gaussians_list[idx1]['xyz']
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor([t], device=device, dtype=dtype)
+        else:
+            t = t.to(device=device, dtype=dtype)
+
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        t = t.view(-1)
+        if t.numel() == 1:
+            t = t.expand(B)
+        elif t.numel() != B:
+            raise ValueError(f"Expected t to have 1 or {B} elements, got {t.numel()}")
+
+        t = t.clamp(0.0, 1.0)
+
+        # Find per-sample bounding frames.
+        t_scaled = t * (N - 1)
+        idx0 = torch.floor(t_scaled).long().clamp(0, N - 1)  # (B,)
+        idx1 = (idx0 + 1).clamp(max=N - 1)  # (B,)
+        alpha = (t_scaled - idx0.float()).view(B, 1, 1)  # (B, 1, 1)
+
+        # Gather corresponding Gaussian positions for each sample.
+        xyz_all = torch.stack([g['xyz'] for g in gaussians_list], dim=0)  # (N, B, num_points, 3)
+        batch_idx = torch.arange(B, device=device)
+        xyz_0 = xyz_all[idx0, batch_idx]  # (B, num_points, 3)
+        xyz_1 = xyz_all[idx1, batch_idx]  # (B, num_points, 3)
         xyz_linear = (1 - alpha) * xyz_0 + alpha * xyz_1
 
         # Loss: deviation from linear path
-        xyz_interp = gaussians_interp['xyz']
         motion_loss = F.mse_loss(xyz_interp, xyz_linear)
 
         return self.motion_weight * motion_loss

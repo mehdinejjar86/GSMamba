@@ -152,18 +152,38 @@ class SS2D(nn.Module):
         if delta_softplus:
             delta = F.softplus(delta)
 
-        # Discretize
-        deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
-        deltaB = torch.einsum('bdl,bknl->bdkln', delta, B.unsqueeze(2).expand(-1, -1, dim, -1, -1))
+        # In this codebase, B/C are provided as (batch, K, n_state, length) while
+        # u/delta/A are flattened across directions as dim = K * d_inner.
+        k_dirs = B.shape[1]
+        if dim % k_dirs != 0:
+            raise ValueError(f"Invalid selective scan shapes: dim={dim}, K={k_dirs}")
+        d_inner = dim // k_dirs
+
+        # Reshape grouped tensors
+        u_g = u.view(batch, k_dirs, d_inner, length)
+        delta_g = delta.view(batch, k_dirs, d_inner, length)
+        A_g = A.view(k_dirs, d_inner, n_state)
+
+        # Precompute exp(delta * A): (batch, K, d_inner, length, n_state)
+        deltaA = torch.exp(delta_g.unsqueeze(-1) * A_g.unsqueeze(0).unsqueeze(3))
 
         # Scan
-        x = torch.zeros(batch, dim, n_state, device=u.device, dtype=u.dtype)
+        x = torch.zeros(batch, k_dirs, d_inner, n_state, device=u.device, dtype=u.dtype)
         ys = []
         for i in range(length):
-            x = deltaA[:, :, i] * x + deltaB[:, :, :, i] * u[:, :, i:i+1]
-            y = torch.einsum('bdn,bkn->bd', x, C[:, :, :, i])
-            ys.append(y)
-        y = torch.stack(ys, dim=-1)
+            # B_i/C_i: (batch, K, n_state) -> broadcast over d_inner
+            B_i = B[:, :, :, i].unsqueeze(2)
+            C_i = C[:, :, :, i].unsqueeze(2)
+
+            # Discretized input contribution: delta * B * u
+            inp = delta_g[:, :, :, i].unsqueeze(-1) * B_i * u_g[:, :, :, i].unsqueeze(-1)
+            x = deltaA[:, :, :, i, :] * x + inp
+
+            # Readout
+            y_i = (x * C_i).sum(-1)  # (batch, K, d_inner)
+            ys.append(y_i)
+
+        y = torch.stack(ys, dim=-1).reshape(batch, dim, length)
 
         if D is not None:
             y = y + u * D.unsqueeze(0).unsqueeze(-1)

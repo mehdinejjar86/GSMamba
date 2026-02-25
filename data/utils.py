@@ -10,7 +10,7 @@ import os
 from typing import Optional, List, Union, Literal
 
 import torch
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, Subset
 
 from data.vimeo import VimeoTriplet, VimeoSeptuplet, vimeo_collate
 from data.x4k import (
@@ -24,6 +24,52 @@ from data.x4k import (
     x4k_sequence_collate,
 )
 from data.samplers import PureBatchSampler, DistributedPureBatchSampler, CurriculumSampler
+
+
+def _normalize_ratios(ratios: List[float]) -> List[float]:
+    """Normalize ratios to sum to 1.0 with stable last-element correction."""
+    total = sum(ratios)
+    if total <= 0:
+        raise ValueError(f"Ratios must sum to > 0, got {ratios}")
+
+    norm = [r / total for r in ratios]
+    norm[-1] = 1.0 - sum(norm[:-1])
+    return norm
+
+
+def _expand_mixed_ratios(
+    base_ratios: List[float],
+    x4k_group_sizes: List[int],
+) -> List[float]:
+    """
+    Expand mixed-mode dataset ratios when X4K is split by N.
+
+    Supports:
+      - Legacy format: [vimeo_ratio, x4k_ratio]
+      - Explicit format: [vimeo_ratio, x4k_n1_ratio, x4k_n2_ratio, ...]
+    """
+    num_x4k_groups = len(x4k_group_sizes)
+    if num_x4k_groups == 0:
+        raise ValueError("No X4K N-groups available for mixed training")
+
+    if len(base_ratios) == 2:
+        vimeo_ratio, x4k_ratio = base_ratios
+        total_x4k = sum(x4k_group_sizes)
+        if total_x4k <= 0:
+            raise ValueError("X4K split groups are empty in mixed mode")
+
+        # Keep the overall Vimeo/X4K ratio, split X4K across N-groups by sample count.
+        x4k_group_ratios = [x4k_ratio * (sz / total_x4k) for sz in x4k_group_sizes]
+        return _normalize_ratios([vimeo_ratio] + x4k_group_ratios)
+
+    if len(base_ratios) == 1 + num_x4k_groups:
+        return _normalize_ratios(base_ratios)
+
+    raise ValueError(
+        f"dataset_ratios length mismatch for mixed mode with X4K split-by-N: "
+        f"got {len(base_ratios)} ratios, expected 2 (legacy) or {1 + num_x4k_groups} "
+        f"(vimeo + each X4K N-group)."
+    )
 
 
 def get_dataset(
@@ -90,6 +136,8 @@ def create_train_loader(
 
     batch_size = getattr(data_cfg, 'batch_size', 4)
     num_workers = getattr(data_cfg, 'num_workers', 4)
+    mixed_full_coverage = getattr(data_cfg, 'full_coverage_mixed', True)
+    mixed_drop_last = getattr(data_cfg, 'drop_last_mixed', False)
 
     # Default X4K settings
     if x4k_steps is None:
@@ -193,33 +241,52 @@ def create_train_loader(
             aug_reverse=True,
         )
 
-        concat = ConcatDataset([vimeo, x4k])
-        ratios = getattr(data_cfg, 'dataset_ratios', [0.7, 0.3])
+        # Treat each X4K N-group as a separate "dataset" to keep pure batches shape-consistent.
+        x4k_n_values = x4k.get_n_frames_values()
+        x4k_subsets = []
+        x4k_group_sizes = []
+        for n in x4k_n_values:
+            indices = x4k.get_samples_with_n(n)
+            if not indices:
+                continue
+            subset = Subset(x4k, indices)
+            x4k_subsets.append(subset)
+            x4k_group_sizes.append(len(subset))
+
+        if not x4k_subsets:
+            raise ValueError("X4K produced no valid N-group subsets for mixed training")
+
+        concat = ConcatDataset([vimeo] + x4k_subsets)
+        raw_ratios = getattr(data_cfg, 'dataset_ratios', [0.7, 0.3])
+        ratios = _expand_mixed_ratios(raw_ratios, x4k_group_sizes)
+        dataset_sizes = [len(vimeo)] + x4k_group_sizes
 
         if world_size > 1:
             sampler = DistributedPureBatchSampler(
-                dataset_sizes=[len(vimeo), len(x4k)],
+                dataset_sizes=dataset_sizes,
                 batch_size=batch_size,
                 ratios=ratios,
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=True,
-                drop_last=True,
+                drop_last=mixed_drop_last,
+                full_coverage=mixed_full_coverage,
             )
         else:
             sampler = PureBatchSampler(
-                dataset_sizes=[len(vimeo), len(x4k)],
+                dataset_sizes=dataset_sizes,
                 batch_size=batch_size,
                 ratios=ratios,
                 shuffle=True,
-                drop_last=True,
+                drop_last=mixed_drop_last,
+                full_coverage=mixed_full_coverage,
             )
 
         # Mixed collate function that handles both formats
         def mixed_collate(batch):
-            # Check if batch is from Vimeo (N=2) or X4K (variable N)
-            # Both return (frames, anchor_times, target_time, target)
-            return vimeo_collate(batch)  # Same format, so this works
+            # PureBatchSampler guarantees each batch comes from one dataset subset.
+            # With X4K split by N, all samples in the batch now share the same N.
+            return vimeo_collate(batch)
 
         loader = DataLoader(
             concat,

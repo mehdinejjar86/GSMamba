@@ -281,11 +281,12 @@ class X4K1000Dataset(data.Dataset):
             if self.aug_flip and random.random() < 0.5:
                 all_frames = self._hflip_all(all_frames)
             if self.aug_reverse and random.random() < 0.5:
-                # Temporal reversal
-                all_frames = all_frames[::-1]
-                # Recompute target position (reverse the anchor order)
+                # Temporal reversal: reverse only anchors, keep target separate
+                anchor_frames_aug = all_frames[:n_frames][::-1]
+                target_data_aug = all_frames[-1]
+                all_frames = anchor_frames_aug + [target_data_aug]
+                # Recompute target position relative to reversed anchors
                 anchors = anchors[::-1]
-                # Target position relative to reversed anchors
                 target_frame = anchors[0] + (anchors[-1] - target_frame)
 
         # Split anchors and target
@@ -299,8 +300,7 @@ class X4K1000Dataset(data.Dataset):
         anchor_times = torch.linspace(0.0, 1.0, n_frames)
 
         # Target time (normalized position between first and last anchor)
-        original_anchors = self.samples[idx][2]
-        target_time = (target_frame - original_anchors[0]) / (original_anchors[-1] - original_anchors[0])
+        target_time = (target_frame - anchors[0]) / (anchors[-1] - anchors[0])
         target_time = torch.tensor(target_time, dtype=torch.float32).clamp(0.0, 1.0)
 
         return frames, anchor_times, target_time, target_data

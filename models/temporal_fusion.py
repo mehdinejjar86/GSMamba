@@ -83,7 +83,8 @@ class TemporalFusion(nn.Module):
         x = x.view(B * H * W, N, C)
 
         # Add temporal position encoding
-        x = self.pos_encoding(x, timestamps.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W).reshape(B * H * W, N) if timestamps is not None else None)
+        # timestamps: (B, N) -> (B, N, H, W) -> permute to (B, H, W, N) -> (B*H*W, N)
+        x = self.pos_encoding(x, timestamps.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W).permute(0, 2, 3, 1).reshape(B * H * W, N) if timestamps is not None else None)
 
         # Process through temporal SSM layers
         for layer in self.layers:

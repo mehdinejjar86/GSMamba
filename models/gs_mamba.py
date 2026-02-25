@@ -246,10 +246,9 @@ class GSMamba(nn.Module):
             idx1 = nearest_indices[:, 1]
 
             nearest_frames = torch.stack([
-                frames[b, idx0[b]] for b in range(B)
-            ] + [
-                frames[b, idx1[b]] for b in range(B)
-            ], dim=0).view(B, 2, C, H, W)
+                torch.stack([frames[b, idx0[b]], frames[b, idx1[b]]], dim=0)
+                for b in range(B)
+            ], dim=0)  # (B, 2, C, H, W)
 
             # Compute opacity map (sum of Gaussian opacities projected to image)
             opacity = render_output['gaussians']['opacity'].mean(dim=1, keepdim=True)  # (B, 1)

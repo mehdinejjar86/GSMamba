@@ -8,7 +8,7 @@ Supports both fixed weights and uncertainty-based learned weights (Kendall et al
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from losses.photometric import L1Loss, SSIMLoss, LaplacianLoss
 from losses.perceptual import LPIPSLoss
@@ -110,8 +110,8 @@ class GSMambaLoss(nn.Module):
         self.opacity_reg = OpacityRegularizationLoss()
         self.scale_reg = ScaleRegularizationLoss()
 
-        self.use_gflow = use_gflow
-        if use_gflow:
+        self.use_gflow = use_gflow and flow_net is not None
+        if self.use_gflow:
             self.gflow_loss = GaussianFlowLoss(flow_net, image_size)
         else:
             self.gflow_loss = None
@@ -120,7 +120,9 @@ class GSMambaLoss(nn.Module):
         self.use_uncertainty_weighting = use_uncertainty_weighting
         if use_uncertainty_weighting:
             # Loss names that will be weighted by uncertainty
-            loss_names = ['l1', 'ssim', 'lap', 'recon', 'depth', 'temporal', 'gflow', 'opacity_reg', 'scale_reg']
+            loss_names = ['l1', 'ssim', 'lap', 'recon', 'depth', 'temporal', 'opacity_reg', 'scale_reg']
+            if self.use_gflow:
+                loss_names.append('gflow')
 
             # Fixed weights for warmup phase
             fixed_weights = {
@@ -130,10 +132,11 @@ class GSMambaLoss(nn.Module):
                 'recon': w_recon,
                 'depth': w_depth,
                 'temporal': w_temporal,
-                'gflow': w_gflow_max,
                 'opacity_reg': w_opacity_reg,
                 'scale_reg': w_scale_reg,
             }
+            if self.use_gflow:
+                fixed_weights['gflow'] = w_gflow_max
 
             self.uncertainty = ProgressiveUncertaintyWeighting(
                 loss_names=loss_names,
@@ -166,7 +169,7 @@ class GSMambaLoss(nn.Module):
             input_frames: torch.Tensor,
             gaussians_list: List[Dict[str, torch.Tensor]],
             gaussians_interp: Dict[str, torch.Tensor],
-            t: float,
+            t: Union[float, torch.Tensor],
             return_components: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -180,7 +183,7 @@ class GSMambaLoss(nn.Module):
             input_frames: Input frames (B, N, 3, H, W)
             gaussians_list: List of Gaussian dicts for each input frame
             gaussians_interp: Interpolated Gaussians at timestep t
-            t: Interpolation timestep
+            t: Interpolation timestep (scalar or per-sample tensor)
             return_components: Whether to return individual loss components
 
         Returns:
@@ -251,17 +254,30 @@ class GSMambaLoss(nn.Module):
 
         # ========== Apply Weighting ==========
         if self.use_uncertainty_weighting and self.uncertainty is not None:
-            # Apply gflow decay before uncertainty weighting
-            gflow_decay = get_gflow_weight(
-                self.current_epoch,
-                self.total_epochs,
-                1.0,  # Max multiplier
-                self.gflow_decay_fraction
-            )
-            raw_losses['gflow'] = raw_losses['gflow'] * gflow_decay
+            # Apply gflow decay before uncertainty weighting.
+            # Important: if Gaussian Flow is disabled or fully decayed, exclude it from
+            # uncertainty weighting to avoid log_var collapse from the +0.5*log_var term.
+            losses_for_uncertainty = dict(raw_losses)
+            if self.use_gflow and self.gflow_loss is not None:
+                gflow_decay = get_gflow_weight(
+                    self.current_epoch,
+                    self.total_epochs,
+                    1.0,  # Max multiplier
+                    self.gflow_decay_fraction
+                )
+                if gflow_decay > 0:
+                    losses_for_uncertainty['gflow'] = losses_for_uncertainty['gflow'] * gflow_decay
+                else:
+                    losses_for_uncertainty.pop('gflow', None)
+            else:
+                losses_for_uncertainty.pop('gflow', None)
 
             # Use uncertainty-based learned weights
-            total_loss, weighted_losses = self.uncertainty(raw_losses)
+            total_loss, weighted_losses = self.uncertainty(losses_for_uncertainty)
+
+            # Keep logging keys stable even when Gaussian Flow is excluded.
+            if 'gflow' not in weighted_losses:
+                weighted_losses['gflow'] = torch.tensor(0.0, device=device)
 
             # Add LPIPS separately (not in uncertainty weighting)
             weighted_losses['lpips'] = lpips_loss
@@ -317,13 +333,14 @@ class GSMambaLoss(nn.Module):
         return False
 
 
-def build_loss(loss_config, model_config=None) -> GSMambaLoss:
+def build_loss(loss_config, model_config=None, flow_net: Optional[nn.Module] = None) -> GSMambaLoss:
     """
     Build loss function from config.
 
     Args:
         loss_config: LossConfig with loss weights and uncertainty settings
         model_config: Optional GSMambaConfig for image_size
+        flow_net: Optional pretrained flow network for Gaussian Flow Loss
 
     Returns:
         GSMambaLoss instance
@@ -349,5 +366,6 @@ def build_loss(loss_config, model_config=None) -> GSMambaLoss:
         use_uncertainty_weighting=loss_config.use_uncertainty_weighting,
         uncertainty_warmup_epochs=loss_config.uncertainty_warmup_epochs,
         initial_log_vars=loss_config.initial_log_vars,
+        flow_net=flow_net,
         image_size=image_size,
     )
