@@ -225,20 +225,45 @@ class GaussianAssembler(nn.Module):
         self.W = W
 
         # Default focal length: approximate 45 degree FoV
-        self.focal_length = focal_length if focal_length else (H + W) / 2
+        self.focal_length = float(focal_length if focal_length else (H + W) / 2)
 
-        # Create pixel coordinate grid
+        # Create and register initial pixel coordinate grid
         y, x = torch.meshgrid(
             torch.arange(H, dtype=torch.float32),
             torch.arange(W, dtype=torch.float32),
             indexing='ij'
         )
-        # Normalize to [-1, 1] centered
         x = (x - W / 2) / self.focal_length
         y = (y - H / 2) / self.focal_length
-
         self.register_buffer('grid_x', x)
         self.register_buffer('grid_y', y)
+
+    def set_image_size(
+            self,
+            image_size: Tuple[int, int],
+            focal_length: Optional[float] = None,
+    ):
+        """Update spatial grid for a new runtime image size."""
+        H, W = image_size
+        if (H, W) == (self.H, self.W) and focal_length is None:
+            return
+
+        self.H = int(H)
+        self.W = int(W)
+        if focal_length is not None:
+            self.focal_length = float(focal_length)
+        else:
+            self.focal_length = float((self.H + self.W) / 2)
+
+        y, x = torch.meshgrid(
+            torch.arange(self.H, dtype=torch.float32, device=self.grid_x.device),
+            torch.arange(self.W, dtype=torch.float32, device=self.grid_x.device),
+            indexing='ij'
+        )
+        x = (x - self.W / 2) / self.focal_length
+        y = (y - self.H / 2) / self.focal_length
+        self.grid_x = x
+        self.grid_y = y
 
     def forward(self, gaussian_params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """

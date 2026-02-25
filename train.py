@@ -186,6 +186,9 @@ def train_one_epoch(
     total_loss = 0.0
     num_batches = 0
     start_time = time.time()
+    total_samples = 0
+    component_sums = {}
+    last_lr = optimizer.param_groups[0]['lr']
 
     for batch_idx, batch in enumerate(dataloader):
         frames, anchor_times, target_time, target = batch
@@ -235,30 +238,41 @@ def train_one_epoch(
 
         total_loss += loss.item()
         num_batches += 1
+        total_samples += frames.shape[0]
+        last_lr = optimizer.param_groups[0]['lr']
 
-        # Logging
-        global_step = epoch * len(dataloader) + batch_idx
-        if batch_idx % config.train.log_every == 0 and rank == 0:
-            elapsed = time.time() - start_time
-            samples_per_sec = (batch_idx + 1) * frames.shape[0] * world_size / elapsed
-
-            lr = optimizer.param_groups[0]['lr']
-            print(
-                f"Epoch {epoch} [{batch_idx}/{len(dataloader)}] "
-                f"Loss: {loss.item():.4f} "
-                f"LR: {lr:.2e} "
-                f"Speed: {samples_per_sec:.1f} samples/s"
-            )
-
-            # TensorBoard logging
+        # Keep detailed TensorBoard curves without per-step CLI printing.
+        if writer is not None:
+            global_step = epoch * len(dataloader) + batch_idx
             writer.add_scalar('train/loss', loss.item(), global_step)
-            writer.add_scalar('train/lr', lr, global_step)
-            for key, value in losses.items():
-                if key != 'total':
-                    writer.add_scalar(f'train/{key}', value.item(), global_step)
+            writer.add_scalar('train/lr', last_lr, global_step)
+
+        for key, value in losses.items():
+            if key == 'total':
+                continue
+            component_sums[key] = component_sums.get(key, 0.0) + value.item()
+            if writer is not None:
+                writer.add_scalar(f'train/{key}', value.item(), global_step)
 
     # Log uncertainty weights at end of epoch
     if rank == 0:
+        elapsed = max(time.time() - start_time, 1e-6)
+        samples_per_sec = total_samples * world_size / elapsed
+
+        avg_loss = total_loss / max(num_batches, 1)
+        print(
+            f"Epoch {epoch} summary: "
+            f"Train Loss={avg_loss:.4f} "
+            f"LR={last_lr:.2e} "
+            f"Speed={samples_per_sec:.1f} samples/s"
+        )
+
+        if writer is not None:
+            writer.add_scalar('train/loss_epoch', avg_loss, epoch)
+            writer.add_scalar('train/lr_epoch', last_lr, epoch)
+            for key, value_sum in component_sums.items():
+                writer.add_scalar(f'train/{key}_epoch', value_sum / max(num_batches, 1), epoch)
+
         uncertainty_stats = criterion.get_uncertainty_stats()
         if uncertainty_stats is not None:
             for name, weight in uncertainty_stats['weights'].items():
@@ -271,7 +285,7 @@ def train_one_epoch(
             weight_str = ', '.join([f"{k}={v:.3f}" for k, v in uncertainty_stats['weights'].items()])
             print(f"Epoch {epoch} uncertainty weights ({'warmup' if is_warmup else 'learned'}): {weight_str}")
 
-    avg_loss = total_loss / num_batches
+    avg_loss = total_loss / max(num_batches, 1)
     return avg_loss
 
 
@@ -412,19 +426,22 @@ def evaluate_full(
         print(f"Full Evaluation - X4K Cascaded 8x (Epoch {epoch})")
         print(f"{'='*60}")
         try:
-            # Use 2K mode for faster validation during training
+            # Validate at configured resolution (default: full-res 4K).
+            x4k_scale = getattr(getattr(config, 'data', config), 'x4k_scale', '4k').lower()
+            eval_mode = 'XTEST-4k' if x4k_scale == '4k' else 'XTEST-2k'
             x4k_results = evaluate_x4k(
-                raw_model, x4k_path, device, modes=['XTEST-2k'], use_lpips=False,
+                raw_model, x4k_path, device, modes=[eval_mode], use_lpips=False,
                 samples_dir=samples_dir / "x4k_full" if samples_dir and save_samples else None,
                 save_samples=save_samples,
                 epoch=epoch,
             )
-            results['x4k'] = x4k_results.get('XTEST-2k', {})
+            results['x4k'] = x4k_results.get(eval_mode, {})
 
-            if 'XTEST-2k' in x4k_results:
-                r = x4k_results['XTEST-2k']
-                print(f"X4K (2K) PSNR: {r['psnr']:.4f} dB")
-                print(f"X4K (2K) SSIM: {r['ssim']:.4f}")
+            if eval_mode in x4k_results:
+                r = x4k_results[eval_mode]
+                label = "4K" if eval_mode == 'XTEST-4k' else "2K"
+                print(f"X4K ({label}) PSNR: {r['psnr']:.4f} dB")
+                print(f"X4K ({label}) SSIM: {r['ssim']:.4f}")
 
                 writer.add_scalar('eval_full/x4k_psnr', r['psnr'], epoch)
                 writer.add_scalar('eval_full/x4k_ssim', r['ssim'], epoch)
@@ -730,33 +747,28 @@ def main():
         if scheduler is not None:
             scheduler.step()
 
+        # Quick evaluation at the end of every epoch.
+        save_samples = (
+            args.save_samples_every > 0 and
+            epoch % args.save_samples_every == 0
+        )
+
+        eval_loss, eval_psnr = evaluate(
+            model, criterion, eval_loader, epoch, config, writer, rank,
+            samples_dir=samples_dir,
+            save_samples=save_samples,
+        )
+
+        is_best = eval_psnr > best_psnr
+        if is_best:
+            best_psnr = eval_psnr
+
+        # Save checkpoint every epoch (best is tracked separately).
         if is_main:
-            print(f"Epoch {epoch} completed. Train Loss: {train_loss:.4f}")
-
-        # Quick evaluation (frequent)
-        if epoch % config.train.eval_every == 0:
-            # Determine if we should save samples this epoch
-            save_samples = (
-                args.save_samples_every > 0 and
-                epoch % args.save_samples_every == 0
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                epoch, config, output_dir, is_best
             )
-
-            eval_loss, eval_psnr = evaluate(
-                model, criterion, eval_loader, epoch, config, writer, rank,
-                samples_dir=samples_dir,
-                save_samples=save_samples,
-            )
-
-            is_best = eval_psnr > best_psnr
-            if is_best:
-                best_psnr = eval_psnr
-
-            # Save checkpoint
-            if is_main:
-                save_checkpoint(
-                    model, optimizer, scheduler, scaler,
-                    epoch, config, output_dir, is_best
-                )
 
         # Full benchmark evaluation (less frequent)
         # Includes Vimeo test and X4K cascaded 8x

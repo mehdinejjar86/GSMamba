@@ -156,6 +156,17 @@ class GaussianRenderer(nn.Module):
         # Camera will be created lazily on first forward pass
         self._camera = None
 
+    def set_image_size(self, image_size: Tuple[int, int]):
+        """Update output image size and reset cached camera."""
+        H, W = image_size
+        H = int(H)
+        W = int(W)
+        if (H, W) == (self.height, self.width):
+            return
+        self.height = H
+        self.width = W
+        self._camera = None
+
     def _get_camera(self, device: torch.device) -> CameraParams:
         """Get or create camera parameters."""
         if self._camera is None or self._camera.world_view_transform.device != device:

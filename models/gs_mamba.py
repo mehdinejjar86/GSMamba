@@ -102,6 +102,22 @@ class GSMamba(nn.Module):
                 use_features=False,
             )
 
+    def _set_runtime_image_size(self, image_size: Tuple[int, int]):
+        """
+        Update size-dependent submodules for runtime HxW.
+
+        This enables full-resolution validation/inference even when runtime
+        frame size differs from the initial config.
+        """
+        H, W = int(image_size[0]), int(image_size[1])
+        if (H, W) == tuple(self.config.image_size):
+            return
+
+        self.config.image_size = (H, W)
+        self.gaussian_head.out_resolution = (H, W)
+        self.gaussian_assembler.set_image_size((H, W))
+        self.renderer.set_image_size((H, W))
+
     def encode_frames(
             self,
             frames: torch.Tensor,
@@ -121,13 +137,8 @@ class GSMamba(nn.Module):
         """
         B, N, C, H, W = frames.shape
         device = frames.device
-        expected_h, expected_w = self.config.image_size
-        if (H, W) != (expected_h, expected_w):
-            raise ValueError(
-                f"Input frame size {(H, W)} does not match model.image_size "
-                f"{(expected_h, expected_w)}. Update config.model.image_size "
-                f"(or pass --image_size) to match your training crop/resolution."
-            )
+        if (H, W) != tuple(self.config.image_size):
+            self._set_runtime_image_size((H, W))
 
         # Default timestamps: uniform spacing
         if timestamps is None:
