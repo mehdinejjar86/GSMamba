@@ -291,13 +291,10 @@ def train_one_epoch(
                 writer.add_scalar(f'train/{key}', value.item(), global_step)
 
         if use_tqdm:
-            avg_loss_running = total_loss / max(num_batches, 1)
-            avg_psnr_running = total_psnr / max(num_batches, 1)
-            avg_ssim_running = total_ssim / max(num_batches, 1)
             iterator.set_postfix({
-                'loss': f"{avg_loss_running:.4f}",
-                'psnr': f"{avg_psnr_running:.2f}",
-                'ssim': f"{avg_ssim_running:.4f}",
+                'loss': f"{loss.item():.4f}",
+                'psnr': f"{batch_psnr:.2f}",
+                'ssim': f"{batch_ssim:.4f}",
                 'lr': f"{last_lr:.2e}",
             })
 
@@ -406,6 +403,8 @@ def evaluate(
         total_psnr += psnr.sum().item()
         ssim_val = 1.0 - ssim_metric(pred.float(), target.float())
         total_ssim += ssim_val.item() * frames.shape[0]
+        batch_psnr = psnr.mean().item()
+        batch_ssim = ssim_val.item()
 
         # Simple L1 loss for eval
         loss = nn.functional.l1_loss(pred, target)
@@ -414,13 +413,10 @@ def evaluate(
         total_samples += frames.shape[0]
 
         if use_tqdm:
-            avg_loss_running = total_loss / max(num_batches, 1)
-            avg_psnr_running = total_psnr / max(total_samples, 1)
-            avg_ssim_running = total_ssim / max(total_samples, 1)
             iterator.set_postfix({
-                'loss': f"{avg_loss_running:.4f}",
-                'psnr': f"{avg_psnr_running:.2f}",
-                'ssim': f"{avg_ssim_running:.4f}",
+                'loss': f"{loss.item():.4f}",
+                'psnr': f"{batch_psnr:.2f}",
+                'ssim': f"{batch_ssim:.4f}",
             })
 
         # Save sample images to disk (like SPACE)

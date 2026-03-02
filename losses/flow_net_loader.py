@@ -9,8 +9,59 @@ import sys
 import os
 import torch
 import torch.nn as nn
-from typing import Optional
-from functools import partial
+
+
+def _import_flow_modules():
+    """
+    Import VFIMamba flow components.
+
+    Preferred source:
+      1) Local vendored package: optical_flow_model/*
+      2) External VFIMamba checkout fallback
+    """
+    # 1) Vendored minimal flow package in this repo.
+    try:
+        from optical_flow_model.feature_extractor import feature_extractor as mamba_extractor
+        from optical_flow_model.flow_estimation import MultiScaleFlow as mamba_estimation
+        return mamba_extractor, mamba_estimation, "optical_flow_model"
+    except Exception as vendored_err:
+        vendored_msg = str(vendored_err)
+
+    # 2) Backward-compatible fallback to full VFIMamba repo directory.
+    losses_dir = os.path.abspath(os.path.dirname(__file__))
+    repo_root = os.path.abspath(os.path.join(losses_dir, ".."))
+    candidate_dirs = [
+        os.path.join(repo_root, "VFIMamba"),               # preferred: GSMamba/VFIMamba
+        os.path.join(repo_root, "..", "VFIMamba"),         # legacy: sibling repo
+    ]
+
+    prev_path = sys.path.copy()
+    try:
+        for vfimamba_dir in candidate_dirs:
+            vfimamba_dir = os.path.abspath(vfimamba_dir)
+            if not os.path.isdir(vfimamba_dir):
+                continue
+            sys.path.insert(0, vfimamba_dir)
+            try:
+                from model.feature_extractor import feature_extractor as mamba_extractor
+                from model.flow_estimation import MultiScaleFlow as mamba_estimation
+                return mamba_extractor, mamba_estimation, vfimamba_dir
+            except Exception:
+                # Try next candidate.
+                continue
+            finally:
+                # Remove just-added path entry before trying next.
+                if sys.path and sys.path[0] == vfimamba_dir:
+                    sys.path.pop(0)
+    finally:
+        sys.path = prev_path
+
+    raise FileNotFoundError(
+        "Could not import VFIMamba flow modules. "
+        "Tried local vendored package 'optical_flow_model' and VFIMamba directories: "
+        f"{', '.join(os.path.abspath(p) for p in candidate_dirs)}. "
+        f"Vendored import error: {vendored_msg}"
+    )
 
 
 def load_vfimamba_flow_net(
@@ -29,24 +80,8 @@ def load_vfimamba_flow_net(
     Returns:
         VFIMamba MultiScaleFlow model (frozen, eval mode)
     """
-    # Add VFIMamba to path temporarily
-    vfimamba_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'VFIMamba')
-    vfimamba_dir = os.path.abspath(vfimamba_dir)
-
-    if not os.path.isdir(vfimamba_dir):
-        raise FileNotFoundError(
-            f"VFIMamba directory not found at {vfimamba_dir}. "
-            f"Make sure the VFIMamba repo is at the project root."
-        )
-
-    # Import VFIMamba components
-    prev_path = sys.path.copy()
-    sys.path.insert(0, vfimamba_dir)
-    try:
-        from model.feature_extractor import feature_extractor as mamba_extractor
-        from model.flow_estimation import MultiScaleFlow as mamba_estimation
-    finally:
-        sys.path = prev_path
+    # Import VFIMamba components (vendored package first).
+    mamba_extractor, mamba_estimation, import_source = _import_flow_modules()
 
     # Model config based on size
     if model_size.upper() == "S":
@@ -84,6 +119,11 @@ def load_vfimamba_flow_net(
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     state_dict = torch.load(ckpt_path, map_location='cpu')
+    if isinstance(state_dict, dict):
+        if 'state_dict' in state_dict and isinstance(state_dict['state_dict'], dict):
+            state_dict = state_dict['state_dict']
+        elif 'model' in state_dict and isinstance(state_dict['model'], dict):
+            state_dict = state_dict['model']
 
     # Handle DDP-wrapped checkpoints (module. prefix)
     cleaned = {
@@ -100,5 +140,8 @@ def load_vfimamba_flow_net(
     for param in flow_net.parameters():
         param.requires_grad = False
 
-    print(f"Loaded VFIMamba-{model_size.upper()} flow network from {ckpt_path}")
+    print(
+        f"Loaded VFIMamba-{model_size.upper()} flow network from {ckpt_path} "
+        f"(source: {import_source})"
+    )
     return flow_net
