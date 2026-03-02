@@ -857,21 +857,33 @@ def main():
         if scheduler is not None:
             scheduler.step()
 
+        run_full_eval_this_epoch = (
+            args.eval_full_every > 0 and
+            epoch % args.eval_full_every == 0
+        )
+
         # Quick evaluation at the end of every epoch.
         save_samples = (
             args.save_samples_every > 0 and
             epoch % args.save_samples_every == 0
         )
 
-        eval_loss, eval_psnr = evaluate(
-            model, criterion, eval_loader, epoch, config, writer, device, rank,
-            samples_dir=samples_dir,
-            save_samples=save_samples,
-        )
+        if run_full_eval_this_epoch:
+            # Avoid duplicate validation passes on full-eval epochs.
+            eval_loss, eval_psnr = None, None
+            is_best = False
+            if is_main:
+                print(f"Epoch {epoch}: skipping quick eval (full evaluation scheduled).")
+        else:
+            eval_loss, eval_psnr = evaluate(
+                model, criterion, eval_loader, epoch, config, writer, device, rank,
+                samples_dir=samples_dir,
+                save_samples=save_samples,
+            )
 
-        is_best = eval_psnr > best_psnr
-        if is_best:
-            best_psnr = eval_psnr
+            is_best = eval_psnr > best_psnr
+            if is_best:
+                best_psnr = eval_psnr
 
         # Save checkpoint every epoch (best is tracked separately).
         if is_main:
@@ -882,7 +894,7 @@ def main():
 
         # Full benchmark evaluation (less frequent)
         # Includes Vimeo test and X4K cascaded 8x
-        if epoch % args.eval_full_every == 0 and is_main:
+        if run_full_eval_this_epoch and is_main:
             # Determine paths
             vimeo_test_path = args.vimeo_root or config.data.vimeo_root
             x4k_test_path = args.x4k_test_root or config.data.x4k_test_root
