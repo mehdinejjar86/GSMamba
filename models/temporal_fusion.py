@@ -277,15 +277,18 @@ class HybridTemporalFusion(nn.Module):
         self.pos_encoding = TemporalPositionEncoding(dim)
 
         # Interleave SSM and attention
+        self.layer_types = []
         self.layers = nn.ModuleList()
         total_layers = num_ssm_layers + num_attn_layers
         attn_positions = set(range(num_ssm_layers, total_layers))  # Attention at end
 
         for i in range(total_layers):
             if i in attn_positions:
-                self.layers.append(('attn', CrossFrameAttention(dim, num_heads)))
+                self.layer_types.append('attn')
+                self.layers.append(CrossFrameAttention(dim, num_heads))
             else:
-                self.layers.append(('ssm', TemporalSSMBlock(dim, d_state)))
+                self.layer_types.append('ssm')
+                self.layers.append(TemporalSSMBlock(dim, d_state))
 
         self.norm = nn.LayerNorm(dim)
 
@@ -306,7 +309,7 @@ class HybridTemporalFusion(nn.Module):
         """
         B, N, C, H, W = features.shape
 
-        for layer_type, layer in self.layers:
+        for layer_type, layer in zip(self.layer_types, self.layers):
             if layer_type == 'ssm':
                 # Reshape for SSM: (B*H*W, N, C)
                 x = features.permute(0, 3, 4, 1, 2).contiguous().view(B * H * W, N, C)

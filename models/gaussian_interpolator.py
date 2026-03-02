@@ -102,9 +102,26 @@ class GaussianInterpolator(nn.Module):
         B, N = timestamps.shape
 
         if not isinstance(t, torch.Tensor):
-            t = torch.tensor([t], device=timestamps.device)
+            t = torch.tensor(t, device=timestamps.device, dtype=timestamps.dtype)
+        else:
+            t = t.to(device=timestamps.device, dtype=timestamps.dtype)
+
+        # Normalize t to shape (B,), supporting scalar, (1,), (B,), or (B,1)
         if t.dim() == 0:
-            t = t.unsqueeze(0)
+            t = t.expand(B)
+        elif t.dim() == 1:
+            if t.shape[0] == 1 and B > 1:
+                t = t.expand(B)
+            elif t.shape[0] != B:
+                raise ValueError(f"t must have shape (B,) with B={B}, got {tuple(t.shape)}")
+        elif t.dim() == 2 and t.shape[1] == 1:
+            t = t.squeeze(1)
+            if t.shape[0] == 1 and B > 1:
+                t = t.expand(B)
+            elif t.shape[0] != B:
+                raise ValueError(f"t must have shape (B,1) with B={B}, got {tuple(t.shape)}")
+        else:
+            raise ValueError(f"Unsupported t shape: {tuple(t.shape)}")
 
         t = t.view(B, 1)
 
@@ -187,7 +204,16 @@ class GaussianInterpolator(nn.Module):
 
         # Default timestamps: uniform spacing
         if timestamps is None:
-            timestamps = torch.linspace(0, 1, N, device=device)
+            timestamps = torch.linspace(0, 1, N, device=device).unsqueeze(0).expand(B, -1)
+        elif timestamps.dim() == 1:
+            timestamps = timestamps.unsqueeze(0).expand(B, -1)
+        elif timestamps.dim() == 2 and timestamps.shape[0] == 1 and B > 1:
+            timestamps = timestamps.expand(B, -1)
+        elif timestamps.dim() == 2 and timestamps.shape[0] != B:
+            raise ValueError(
+                f"timestamps batch size must match gaussians batch size {B}, "
+                f"got {timestamps.shape[0]}"
+            )
 
         # Find bounding frames
         idx0, idx1, alpha = self._find_bounding_frames(t, timestamps)

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, NamedTuple
 import math
 import numpy as np
+from contextlib import nullcontext
 
 # Try to import the CUDA rasterizer
 try:
@@ -191,14 +192,15 @@ class GaussianRenderer(nn.Module):
         Returns:
             Tuple of (rendered_image, depth_image)
         """
-        if not RASTERIZER_AVAILABLE:
+        if not RASTERIZER_AVAILABLE or gaussians['xyz'].device.type != 'cuda':
             return self._fallback_render(gaussians, camera)
 
         num_gaussians = gaussians['xyz'].shape[0]
         device = gaussians['xyz'].device
 
-        # Prepare Gaussian parameters
-        means3D = gaussians['xyz']  # (N, 3)
+        # Rasterizer kernels expect FP32 even when caller is under AMP.
+        # Keep rendering numerically stable and compatible across extension versions.
+        means3D = gaussians['xyz'].float()  # (N, 3)
 
         # Screenspace points for gradient flow
         screenspace_points = torch.zeros_like(means3D, requires_grad=True) + 0
@@ -208,17 +210,17 @@ class GaussianRenderer(nn.Module):
             pass
 
         # Scale: already positive from softplus in GaussianHead
-        scales = gaussians['scale']  # (N, 3)
+        scales = gaussians['scale'].float()  # (N, 3)
 
         # Rotation: convert angle to quaternion
-        rotations = rotation_to_quaternion(gaussians['rotation'])  # (N, 4)
+        rotations = rotation_to_quaternion(gaussians['rotation'].float())  # (N, 4)
         rotations = F.normalize(rotations, dim=-1)
 
         # Opacity
-        opacities = gaussians['opacity']  # (N, 1)
+        opacities = gaussians['opacity'].float()  # (N, 1)
 
         # Color to SH (degree 0)
-        colors = gaussians['color']  # (N, 3)
+        colors = gaussians['color'].float()  # (N, 3)
         # Convert RGB to SH DC coefficient
         # For SH degree 0: color = SH_C0 * dc, where SH_C0 = 0.28209479177387814
         SH_C0 = 0.28209479177387814
@@ -232,35 +234,79 @@ class GaussianRenderer(nn.Module):
         shs = torch.cat([features_dc, features_rest], dim=1)  # (N, 1, 3)
 
         # Setup rasterization settings
-        raster_settings = GaussianRasterizationSettings(
+        # Support both old and new diff-gaussian-rasterization signatures.
+        settings_kwargs = dict(
             image_height=camera.height,
             image_width=camera.width,
             tanfovx=math.tan(camera.fov_x * 0.5),
             tanfovy=math.tan(camera.fov_y * 0.5),
-            bg=self.bg_color.to(device),
+            bg=self.bg_color.to(device=device, dtype=torch.float32),
             scale_modifier=1.0,
-            viewmatrix=camera.world_view_transform,
-            projmatrix=camera.full_proj_transform,
+            viewmatrix=camera.world_view_transform.float(),
+            projmatrix=camera.full_proj_transform.float(),
             sh_degree=self.sh_degree,
-            campos=camera.camera_center,
+            campos=camera.camera_center.float(),
             prefiltered=False,
             debug=False,
-            antialiasing=False,
         )
+        try:
+            raster_settings = GaussianRasterizationSettings(
+                antialiasing=False,
+                **settings_kwargs,
+            )
+        except TypeError:
+            raster_settings = GaussianRasterizationSettings(**settings_kwargs)
 
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-        # Render
-        rendered_image, radii, depth_image = rasterizer(
-            means3D=means3D,
-            means2D=screenspace_points,
-            shs=shs,
-            colors_precomp=None,
-            opacities=opacities,
-            scales=scales,
-            rotations=rotations,
-            cov3D_precomp=None,
-        )
+        # Disable autocast around the extension call to prevent half-precision
+        # dispatch when AMP is active.
+        if means3D.is_cuda:
+            autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=False)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            raster_out = rasterizer(
+                means3D=means3D.float(),
+                means2D=screenspace_points.float(),
+                shs=shs.float(),
+                colors_precomp=None,
+                opacities=opacities.float(),
+                scales=scales.float(),
+                rotations=rotations.float(),
+                cov3D_precomp=None,
+            )
+
+        # Compatibility across diff-gaussian-rasterization variants:
+        # - newer APIs may return (render, radii, depth)
+        # - older APIs may return (render, radii)
+        if isinstance(raster_out, (tuple, list)):
+            if len(raster_out) == 3:
+                rendered_image, _, depth_image = raster_out
+            elif len(raster_out) == 2:
+                rendered_image, _ = raster_out
+                depth_image = torch.zeros(
+                    1, camera.height, camera.width,
+                    device=device, dtype=rendered_image.dtype
+                )
+            else:
+                raise RuntimeError(
+                    f"Unexpected rasterizer return tuple length: {len(raster_out)}"
+                )
+        elif torch.is_tensor(raster_out):
+            rendered_image = raster_out
+            depth_image = torch.zeros(
+                1, camera.height, camera.width,
+                device=device, dtype=rendered_image.dtype
+            )
+        else:
+            raise RuntimeError(
+                f"Unexpected rasterizer return type: {type(raster_out)}"
+            )
+
+        if depth_image.dim() == 2:
+            depth_image = depth_image.unsqueeze(0)
 
         rendered_image = rendered_image.clamp(0, 1)
 

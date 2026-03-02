@@ -40,21 +40,23 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
+from tqdm.auto import tqdm
+
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:
+    SummaryWriter = None
 
 from config import get_full_config, update_config_from_args, FullConfig
 from models.gs_mamba import GSMamba, build_model
 from losses.combined import GSMambaLoss, build_loss
+from losses.photometric import SSIMLoss
 from data import (
     create_train_loader,
     create_eval_loader,
     get_curriculum_settings,
 )
-
-# Import evaluation functions for comprehensive validation
-from eval import evaluate_vimeo, evaluate_x4k, evaluate_all
 
 
 def setup_distributed():
@@ -64,8 +66,10 @@ def setup_distributed():
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
-        dist.init_process_group(backend='nccl')
-        torch.cuda.set_device(local_rank)
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend=backend)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
 
         return rank, world_size, local_rank
     else:
@@ -176,6 +180,7 @@ def train_one_epoch(
     epoch: int,
     config: FullConfig,
     writer: SummaryWriter,
+    device: torch.device,
     rank: int = 0,
     world_size: int = 1,
 ):
@@ -189,20 +194,40 @@ def train_one_epoch(
     total_samples = 0
     component_sums = {}
     last_lr = optimizer.param_groups[0]['lr']
+    total_psnr = 0.0
+    total_ssim = 0.0
 
-    for batch_idx, batch in enumerate(dataloader):
+    # Use criterion's SSIM implementation for consistent metric computation.
+    ssim_metric = getattr(criterion, 'ssim_loss', None)
+    if ssim_metric is None:
+        ssim_metric = SSIMLoss().to(device)
+
+    use_tqdm = (rank == 0)
+    iterator = dataloader
+    if use_tqdm:
+        iterator = tqdm(
+            dataloader,
+            desc=f"Train {epoch}",
+            total=len(dataloader),
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+    for batch_idx, batch in enumerate(iterator):
         frames, anchor_times, target_time, target = batch
 
-        # Move to GPU
-        frames = frames.cuda(non_blocking=True)
-        anchor_times = anchor_times.cuda(non_blocking=True)
-        target_time = target_time.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        # Move to runtime device
+        non_blocking = (device.type == 'cuda')
+        frames = frames.to(device, non_blocking=non_blocking)
+        anchor_times = anchor_times.to(device, non_blocking=non_blocking)
+        target_time = target_time.to(device, non_blocking=non_blocking)
+        target = target.to(device, non_blocking=non_blocking)
 
         # Forward pass
         optimizer.zero_grad()
 
-        with autocast(enabled=config.train.use_amp):
+        use_amp = config.train.use_amp and device.type == 'cuda'
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             # Model forward
             output = model(
                 frames=frames,
@@ -225,6 +250,13 @@ def train_one_epoch(
 
             loss = losses['total']
 
+        with torch.no_grad():
+            pred_metrics = output['pred'].detach().float().clamp(0, 1)
+            target_metrics = target.detach().float().clamp(0, 1)
+            mse = ((pred_metrics - target_metrics) ** 2).mean(dim=[1, 2, 3])
+            batch_psnr = (-10 * torch.log10(mse + 1e-8)).mean().item()
+            batch_ssim = (1.0 - ssim_metric(pred_metrics, target_metrics)).item()
+
         # Backward pass
         scaler.scale(loss).backward()
 
@@ -240,12 +272,16 @@ def train_one_epoch(
         num_batches += 1
         total_samples += frames.shape[0]
         last_lr = optimizer.param_groups[0]['lr']
+        total_psnr += batch_psnr
+        total_ssim += batch_ssim
 
         # Keep detailed TensorBoard curves without per-step CLI printing.
         if writer is not None:
             global_step = epoch * len(dataloader) + batch_idx
             writer.add_scalar('train/loss', loss.item(), global_step)
             writer.add_scalar('train/lr', last_lr, global_step)
+            writer.add_scalar('train/psnr', batch_psnr, global_step)
+            writer.add_scalar('train/ssim', batch_ssim, global_step)
 
         for key, value in losses.items():
             if key == 'total':
@@ -254,31 +290,52 @@ def train_one_epoch(
             if writer is not None:
                 writer.add_scalar(f'train/{key}', value.item(), global_step)
 
+        if use_tqdm:
+            avg_loss_running = total_loss / max(num_batches, 1)
+            avg_psnr_running = total_psnr / max(num_batches, 1)
+            avg_ssim_running = total_ssim / max(num_batches, 1)
+            iterator.set_postfix({
+                'loss': f"{avg_loss_running:.4f}",
+                'psnr': f"{avg_psnr_running:.2f}",
+                'ssim': f"{avg_ssim_running:.4f}",
+                'lr': f"{last_lr:.2e}",
+            })
+
+    if use_tqdm:
+        iterator.close()
+
     # Log uncertainty weights at end of epoch
     if rank == 0:
         elapsed = max(time.time() - start_time, 1e-6)
         samples_per_sec = total_samples * world_size / elapsed
 
         avg_loss = total_loss / max(num_batches, 1)
+        avg_psnr = total_psnr / max(num_batches, 1)
+        avg_ssim = total_ssim / max(num_batches, 1)
         print(
             f"Epoch {epoch} summary: "
             f"Train Loss={avg_loss:.4f} "
+            f"PSNR={avg_psnr:.2f}dB "
+            f"SSIM={avg_ssim:.4f} "
             f"LR={last_lr:.2e} "
             f"Speed={samples_per_sec:.1f} samples/s"
         )
 
         if writer is not None:
             writer.add_scalar('train/loss_epoch', avg_loss, epoch)
+            writer.add_scalar('train/psnr_epoch', avg_psnr, epoch)
+            writer.add_scalar('train/ssim_epoch', avg_ssim, epoch)
             writer.add_scalar('train/lr_epoch', last_lr, epoch)
             for key, value_sum in component_sums.items():
                 writer.add_scalar(f'train/{key}_epoch', value_sum / max(num_batches, 1), epoch)
 
         uncertainty_stats = criterion.get_uncertainty_stats()
         if uncertainty_stats is not None:
-            for name, weight in uncertainty_stats['weights'].items():
-                writer.add_scalar(f'uncertainty/weight_{name}', weight, epoch)
-            for name, sigma in uncertainty_stats['sigmas'].items():
-                writer.add_scalar(f'uncertainty/sigma_{name}', sigma, epoch)
+            if writer is not None:
+                for name, weight in uncertainty_stats['weights'].items():
+                    writer.add_scalar(f'uncertainty/weight_{name}', weight, epoch)
+                for name, sigma in uncertainty_stats['sigmas'].items():
+                    writer.add_scalar(f'uncertainty/sigma_{name}', sigma, epoch)
 
             # Print summary
             is_warmup = criterion.is_uncertainty_warmup()
@@ -297,6 +354,7 @@ def evaluate(
     epoch: int,
     config: FullConfig,
     writer: SummaryWriter,
+    device: torch.device,
     rank: int = 0,
     samples_dir: Path = None,
     save_samples: bool = False,
@@ -306,17 +364,32 @@ def evaluate(
 
     total_loss = 0.0
     total_psnr = 0.0
+    total_ssim = 0.0
     num_batches = 0
     total_samples = 0
     samples_saved = False
 
-    for batch in dataloader:
+    ssim_metric = SSIMLoss().to(device)
+
+    use_tqdm = (rank == 0)
+    iterator = dataloader
+    if use_tqdm:
+        iterator = tqdm(
+            dataloader,
+            desc=f"Eval {epoch}",
+            total=len(dataloader),
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+    for batch in iterator:
         frames, anchor_times, target_time, target = batch
 
-        frames = frames.cuda(non_blocking=True)
-        anchor_times = anchor_times.cuda(non_blocking=True)
-        target_time = target_time.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        non_blocking = (device.type == 'cuda')
+        frames = frames.to(device, non_blocking=non_blocking)
+        anchor_times = anchor_times.to(device, non_blocking=non_blocking)
+        target_time = target_time.to(device, non_blocking=non_blocking)
+        target = target.to(device, non_blocking=non_blocking)
 
         # Forward
         output = model(
@@ -331,12 +404,24 @@ def evaluate(
         mse = ((pred - target) ** 2).mean(dim=[1, 2, 3])
         psnr = -10 * torch.log10(mse + 1e-8)
         total_psnr += psnr.sum().item()
+        ssim_val = 1.0 - ssim_metric(pred.float(), target.float())
+        total_ssim += ssim_val.item() * frames.shape[0]
 
         # Simple L1 loss for eval
         loss = nn.functional.l1_loss(pred, target)
         total_loss += loss.item()
         num_batches += 1
         total_samples += frames.shape[0]
+
+        if use_tqdm:
+            avg_loss_running = total_loss / max(num_batches, 1)
+            avg_psnr_running = total_psnr / max(total_samples, 1)
+            avg_ssim_running = total_ssim / max(total_samples, 1)
+            iterator.set_postfix({
+                'loss': f"{avg_loss_running:.4f}",
+                'psnr': f"{avg_psnr_running:.2f}",
+                'ssim': f"{avg_ssim_running:.4f}",
+            })
 
         # Save sample images to disk (like SPACE)
         if save_samples and not samples_saved and rank == 0 and samples_dir is not None:
@@ -352,16 +437,22 @@ def evaluate(
             save_image(grid, out_dir / f"epoch_{epoch:04d}.png", nrow=4)
             samples_saved = True
 
+    if use_tqdm:
+        iterator.close()
+
     avg_loss = total_loss / num_batches
     avg_psnr = total_psnr / total_samples
+    avg_ssim = total_ssim / total_samples
 
     if rank == 0:
-        print(f"Eval Epoch {epoch}: Loss={avg_loss:.4f}, PSNR={avg_psnr:.2f}dB")
-        writer.add_scalar('eval/loss', avg_loss, epoch)
-        writer.add_scalar('eval/psnr', avg_psnr, epoch)
+        print(f"Eval Epoch {epoch}: Loss={avg_loss:.4f}, PSNR={avg_psnr:.2f}dB, SSIM={avg_ssim:.4f}")
+        if writer is not None:
+            writer.add_scalar('eval/loss', avg_loss, epoch)
+            writer.add_scalar('eval/psnr', avg_psnr, epoch)
+            writer.add_scalar('eval/ssim', avg_ssim, epoch)
 
         # Log sample images to TensorBoard
-        if epoch % 10 == 0:
+        if writer is not None and epoch % 10 == 0:
             writer.add_images('eval/prediction', pred[:4], epoch)
             writer.add_images('eval/target', target[:4], epoch)
             writer.add_images('eval/input_0', frames[:4, 0], epoch)
@@ -392,6 +483,9 @@ def evaluate_full(
     if rank != 0:
         return {}
 
+    # Lazy import to avoid requiring eval-time deps (e.g., cv2) for train startup/help.
+    from eval import evaluate_vimeo, evaluate_x4k
+
     # Get raw model (unwrap DDP if needed)
     raw_model = model.module if hasattr(model, 'module') else model
     device = next(raw_model.parameters()).device
@@ -415,8 +509,9 @@ def evaluate_full(
             print(f"Vimeo PSNR: {vimeo_results['psnr']:.4f} dB")
             print(f"Vimeo SSIM: {vimeo_results['ssim']:.4f}")
 
-            writer.add_scalar('eval_full/vimeo_psnr', vimeo_results['psnr'], epoch)
-            writer.add_scalar('eval_full/vimeo_ssim', vimeo_results['ssim'], epoch)
+            if writer is not None:
+                writer.add_scalar('eval_full/vimeo_psnr', vimeo_results['psnr'], epoch)
+                writer.add_scalar('eval_full/vimeo_ssim', vimeo_results['ssim'], epoch)
         except Exception as e:
             print(f"Vimeo evaluation failed: {e}")
 
@@ -443,8 +538,9 @@ def evaluate_full(
                 print(f"X4K ({label}) PSNR: {r['psnr']:.4f} dB")
                 print(f"X4K ({label}) SSIM: {r['ssim']:.4f}")
 
-                writer.add_scalar('eval_full/x4k_psnr', r['psnr'], epoch)
-                writer.add_scalar('eval_full/x4k_ssim', r['ssim'], epoch)
+                if writer is not None:
+                    writer.add_scalar('eval_full/x4k_psnr', r['psnr'], epoch)
+                    writer.add_scalar('eval_full/x4k_ssim', r['ssim'], epoch)
         except Exception as e:
             print(f"X4K evaluation failed: {e}")
 
@@ -557,12 +653,24 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Runtime device (e.g., cuda, cuda:0, cpu)')
 
     args = parser.parse_args()
 
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     is_main = (rank == 0)
+
+    # Select runtime device
+    requested_device = args.device
+    if requested_device.startswith('cuda') and not torch.cuda.is_available():
+        if is_main:
+            print(f"Warning: requested device '{requested_device}' but CUDA is unavailable, falling back to CPU.")
+        requested_device = 'cpu'
+    if requested_device == 'cuda' and torch.cuda.is_available() and world_size > 1:
+        requested_device = f'cuda:{local_rank}'
+    device = torch.device(requested_device)
 
     # Load config
     config = get_full_config(args.model)
@@ -583,18 +691,22 @@ def main():
 
     # Create model (use updated model config from full config)
     model = GSMamba(config.model)
-    model = model.cuda()
+    model = model.to(device)
 
     if is_main:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model: {args.model}")
+        print(f"Device: {device}")
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
 
     # Wrap with DDP
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank])
+        if device.type == 'cuda':
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        else:
+            model = DDP(model)
 
     # Load VFIMamba flow network for Gaussian Flow Loss (if checkpoint provided)
     flow_net = None
@@ -603,14 +715,14 @@ def main():
         flow_net = load_vfimamba_flow_net(
             ckpt_path=args.flow_ckpt,
             model_size=args.flow_model_size,
-            device=f"cuda:{local_rank}" if world_size > 1 else "cuda",
+            device=str(device),
         )
         if is_main:
             print(f"Gaussian Flow supervision enabled with VFIMamba-{args.flow_model_size}")
 
     # Create loss function with uncertainty-based weighting
     criterion = build_loss(config.loss, config.model, flow_net=flow_net)
-    criterion = criterion.cuda()
+    criterion = criterion.to(device)
 
     # Guided-flow policy:
     # Enable only for Vimeo midpoint interpolation phase (mode=vimeo_only + vimeo_mode=interp).
@@ -659,13 +771,15 @@ def main():
     )
 
     scheduler = get_scheduler(optimizer, config)
-    scaler = GradScaler(enabled=config.train.use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=config.train.use_amp and device.type == 'cuda')
 
     # Create eval dataloader
     eval_loader = create_eval_loader(config, dataset_name='vimeo', split='test', batch_size=4)
 
-    # TensorBoard
-    writer = SummaryWriter(output_dir / 'logs') if is_main else None
+    # TensorBoard (optional dependency)
+    writer = SummaryWriter(output_dir / 'logs') if (is_main and SummaryWriter is not None) else None
+    if is_main and SummaryWriter is None:
+        print("Warning: tensorboard is not installed. Continuing without TensorBoard logging.")
 
     # Create samples directory for saving validation visualizations
     samples_dir = output_dir / 'samples'
@@ -741,7 +855,7 @@ def main():
         # Train
         train_loss = train_one_epoch(
             model, criterion, train_loader, optimizer, scheduler, scaler,
-            epoch, config, writer, rank, world_size
+            epoch, config, writer, device, rank, world_size
         )
 
         if scheduler is not None:
@@ -754,7 +868,7 @@ def main():
         )
 
         eval_loss, eval_psnr = evaluate(
-            model, criterion, eval_loader, epoch, config, writer, rank,
+            model, criterion, eval_loader, epoch, config, writer, device, rank,
             samples_dir=samples_dir,
             save_samples=save_samples,
         )

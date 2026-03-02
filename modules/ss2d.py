@@ -100,7 +100,7 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
-        # Use optimized kernel if available
+        # Optimized kernel is available only on CUDA tensors.
         self.selective_scan = selective_scan_fn if selective_scan_fn else self._selective_scan_ref
 
     @staticmethod
@@ -231,8 +231,11 @@ class SS2D(nn.Module):
         As = -torch.exp(self.A_logs).view(-1, self.d_state)
         dt_projs_bias = self.dt_projs_bias.view(-1)
 
+        # Use optimized scan only for CUDA tensors; CPU falls back to reference.
+        scan_fn = selective_scan_fn if (selective_scan_fn is not None and xs_flat.is_cuda) else self._selective_scan_ref
+
         # Selective scan
-        out_y = self.selective_scan(
+        out_y = scan_fn(
             xs_flat, dts_flat,
             As, Bs_flat, Cs_flat, Ds, z=None,
             delta_bias=dt_projs_bias,
