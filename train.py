@@ -82,6 +82,25 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def _silence_non_main_rank(rank: int):
+    """
+    Reduce log noise from non-main DDP workers.
+
+    Keeps rank 0 as the single source of user-facing logs/progress.
+    """
+    if rank == 0:
+        return
+
+    # Silence Python-level prints from worker ranks.
+    import builtins
+    builtins.print = lambda *args, **kwargs: None
+
+    # Keep tqdm disabled outside rank 0.
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    # Reduce C++ distributed warning spam from worker ranks.
+    os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+
+
 def set_seed(seed: int, deterministic: bool = False):
     """Set random seeds for reproducibility."""
     random.seed(seed)
@@ -657,6 +676,7 @@ def main():
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     is_main = (rank == 0)
+    _silence_non_main_rank(rank)
 
     # Select runtime device
     requested_device = args.device
@@ -700,9 +720,14 @@ def main():
     # Wrap with DDP
     if world_size > 1:
         if device.type == 'cuda':
-            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
         else:
-            model = DDP(model)
+            model = DDP(model, find_unused_parameters=False)
 
     # Load VFIMamba flow network for Gaussian Flow Loss (if checkpoint provided)
     flow_net = None
