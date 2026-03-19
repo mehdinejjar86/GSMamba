@@ -115,7 +115,7 @@ def set_seed(seed: int, deterministic: bool = False):
         torch.backends.cudnn.benchmark = True
 
 
-def get_optimizer(model: nn.Module, config: FullConfig) -> torch.optim.Optimizer:
+def get_optimizer(model: nn.Module, config: FullConfig, criterion: nn.Module = None) -> torch.optim.Optimizer:
     """Create optimizer."""
     # Separate parameters for different learning rates
     encoder_params = []
@@ -133,6 +133,17 @@ def get_optimizer(model: nn.Module, config: FullConfig) -> torch.optim.Optimizer
         {'params': encoder_params, 'lr': config.train.learning_rate * 0.1},  # Lower LR for encoder
         {'params': other_params, 'lr': config.train.learning_rate},
     ]
+
+    # Include criterion parameters (e.g. uncertainty log_vars) in the optimizer so
+    # they are stepped, zeroed, and clipped alongside model params.
+    if criterion is not None:
+        criterion_params = [p for p in criterion.parameters() if p.requires_grad]
+        if criterion_params:
+            param_groups.append({
+                'params': criterion_params,
+                'lr': config.train.learning_rate,
+                'weight_decay': 0.0,  # No weight decay on log_vars
+            })
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -272,6 +283,14 @@ def train_one_epoch(
 
             loss = losses['total']
 
+        # Skip batch if loss is non-finite (NaN/Inf from degenerate Gaussians or AMP overflow).
+        # Stepping the optimizer with a bad loss would corrupt all model weights.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            if rank == 0:
+                print(f"\nWarning: non-finite loss ({loss.item()}) at epoch {epoch} batch {batch_idx}, skipping step.")
+            continue
+
         with torch.no_grad():
             pred_metrics = output['pred'].detach().float().clamp(0, 1)
             target_metrics = target.detach().float().clamp(0, 1)
@@ -282,10 +301,11 @@ def train_one_epoch(
         # Backward pass
         scaler.scale(loss).backward()
 
-        # Gradient clipping
+        # Gradient clipping (model + criterion to cover uncertainty log_vars)
         if config.train.grad_clip > 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip)
+            all_params = list(model.parameters()) + list(criterion.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, config.train.grad_clip)
 
         scaler.step(optimizer)
         scaler.update()
@@ -803,7 +823,8 @@ def main():
     prev_use_gflow = criterion.use_gflow
 
     # Create optimizer and scheduler
-    optimizer = get_optimizer(model, config)
+    # Pass criterion so log_vars (uncertainty weighting) are stepped, zeroed, and clipped
+    optimizer = get_optimizer(model, config, criterion=criterion)
 
     # Create initial dataloader (will be recreated with curriculum if enabled)
     # When curriculum is disabled, use CLI-provided x4k_steps/x4k_n_frames from config

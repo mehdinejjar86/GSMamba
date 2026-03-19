@@ -97,7 +97,9 @@ class UncertaintyWeighting(nn.Module):
 
         for name, loss in losses.items():
             if name in self.log_vars:
-                log_var = self.log_vars[name]
+                # Clamp log_var to [-10, 10]: prevents exp(-log_var) from exploding (>22026x)
+                # or collapsing to zero weight, both of which destabilize training.
+                log_var = self.log_vars[name].clamp(-10.0, 10.0)
                 # Precision = 1/σ² = exp(-log_var)
                 precision = torch.exp(-log_var)
                 # Weighted loss = 0.5 * precision * loss + 0.5 * log_var
