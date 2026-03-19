@@ -37,6 +37,11 @@ class DataConfig:
     batch_size: int = 4
     num_workers: int = 4
 
+    # X4K epoch subsampling — fraction of X4K samples to draw per epoch.
+    # 1.0 = use all samples; 0.1 = draw 10% randomly (different subset each epoch).
+    # Useful when X4K generates millions of samples and full-epoch training is too slow.
+    x4k_epoch_fraction: float = 1.0
+
     # Mixed training
     use_mixed_training: bool = False
     # Mixed-mode ratios:
@@ -314,6 +319,8 @@ def update_config_from_args(config: FullConfig, args) -> FullConfig:
         config.data.full_coverage_mixed = args.full_coverage_mixed
     if hasattr(args, 'drop_last_mixed') and args.drop_last_mixed is not None:
         config.data.drop_last_mixed = args.drop_last_mixed
+    if hasattr(args, 'x4k_fraction') and args.x4k_fraction is not None:
+        config.data.x4k_epoch_fraction = float(args.x4k_fraction)
 
     # Update X4K TEMPO-style step/n_frames configuration
     # Note: argparse converts dashes to underscores (x4k-steps -> x4k_steps)

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from config import GSMambaSmallConfig
@@ -103,7 +104,7 @@ def case_interpolator_shapes(ctx: SmokeContext) -> None:
         gaussians.append({
             "xyz": torch.randn(B, P, 3, device=device),
             "scale": torch.rand(B, P, 3, device=device) * 0.1 + 1e-3,
-            "rotation": torch.randn(B, P, 1, device=device),
+            "rotation": F.normalize(torch.randn(B, P, 4, device=device), dim=-1),
             "opacity": torch.sigmoid(torch.randn(B, P, 1, device=device)),
             "color": torch.sigmoid(torch.randn(B, P, 3, device=device)),
         })
@@ -164,7 +165,7 @@ def case_renderer(ctx: SmokeContext) -> None:
     gaussians = {
         "xyz": torch.randn(B, G, 3, device=device),
         "scale": torch.rand(B, G, 3, device=device) * 0.05 + 0.01,
-        "rotation": torch.randn(B, G, 1, device=device) * 0.1,
+        "rotation": F.normalize(torch.randn(B, G, 4, device=device), dim=-1),
         "opacity": torch.sigmoid(torch.randn(B, G, 1, device=device)),
         "color": torch.rand(B, G, 3, device=device),
     }
@@ -411,6 +412,150 @@ def case_x4k_sample(ctx: SmokeContext) -> None:
         raise AssertionError(f"expected {ctx.args.x4k_n_frames} frames, got {frames.shape[0]}")
 
 
+def case_slerp_correctness(ctx: SmokeContext) -> None:
+    _banner("SLERP Correctness")
+    from models.gaussian_interpolator import GaussianInterpolator
+
+    device = ctx.device
+    B, P = 4, 16
+    q0 = F.normalize(torch.randn(B, P, 4, device=device), dim=-1)
+    q1 = F.normalize(torch.randn(B, P, 4, device=device), dim=-1)
+
+    alpha0    = torch.zeros(B, 1, 1, device=device)
+    alpha1    = torch.ones(B, 1, 1, device=device)
+    alpha_mid = torch.full((B, 1, 1), 0.5, device=device)
+
+    out0    = GaussianInterpolator._slerp(q0, q1, alpha0)
+    out1    = GaussianInterpolator._slerp(q0, q1, alpha1)
+    out_mid = GaussianInterpolator._slerp(q0, q1, alpha_mid)
+
+    # t=0 → q0
+    if not torch.allclose(out0, q0, atol=1e-5):
+        raise AssertionError("slerp(q0,q1,0) should equal q0")
+    # t=1 → ±q1 element-wise (each position may independently flip sign for shortest arc)
+    elem_ok = (torch.isclose(out1, q1, atol=1e-4) | torch.isclose(out1, -q1, atol=1e-4)).all()
+    if not elem_ok:
+        raise AssertionError("slerp(q0,q1,1) should equal ±q1 element-wise")
+    # Unit norm at midpoint
+    norms = out_mid.norm(dim=-1)
+    if not torch.allclose(norms, torch.ones_like(norms), atol=1e-5):
+        raise AssertionError(f"slerp output not unit norm: max_err={float((norms - 1).abs().max()):.2e}")
+    # Shortest arc: slerp(q, -q, 0.5) → unit result (not zero vector)
+    out_neg = GaussianInterpolator._slerp(q0, -q0, alpha_mid)
+    norms_neg = out_neg.norm(dim=-1)
+    if not torch.allclose(norms_neg, torch.ones_like(norms_neg), atol=1e-4):
+        raise AssertionError("slerp shortest-arc failed: output not unit norm")
+    _assert_finite("slerp_output", out_mid)
+    print("slerp: endpoints correct, unit-norm, shortest-arc OK")
+
+
+def case_flow_guided_warping(ctx: SmokeContext) -> None:
+    _banner("Flow-Guided Gaussian Warping")
+    from models.gaussian_interpolator import GaussianInterpolator
+
+    device = ctx.device
+    B, H, W = 2, 16, 16
+    N = H * W
+
+    gaussians = []
+    for _ in range(2):
+        gaussians.append({
+            "xyz":      torch.randn(B, N, 3, device=device),
+            "scale":    torch.rand(B, N, 3, device=device) * 0.1 + 1e-3,
+            "rotation": F.normalize(torch.randn(B, N, 4, device=device), dim=-1),
+            "opacity":  torch.sigmoid(torch.randn(B, N, 1, device=device)),
+            "color":    torch.sigmoid(torch.randn(B, N, 3, device=device)),
+        })
+
+    interp = GaussianInterpolator(hidden_dim=32, num_layers=1).to(device).eval()
+    timestamps = torch.tensor([0.0, 1.0], device=device)
+
+    with torch.no_grad():
+        out_base = interp(gaussians, t=0.5, timestamps=timestamps)
+        zero_flow = torch.zeros(B, 4, H, W, device=device)
+        out_zero  = interp(gaussians, t=0.5, timestamps=timestamps, flow=zero_flow)
+        rand_flow = torch.randn(B, 4, H, W, device=device) * 2.0
+        out_rand  = interp(gaussians, t=0.5, timestamps=timestamps, flow=rand_flow)
+
+    if not torch.allclose(out_base['xyz'], out_zero['xyz'], atol=1e-4):
+        raise AssertionError("Zero flow warp should match no-flow baseline")
+    if torch.allclose(out_rand['xyz'], out_base['xyz'], atol=1e-4):
+        raise AssertionError("Non-zero flow should change interpolation output")
+    _assert_finite("flow_warped_xyz", out_rand['xyz'])
+    print("flow warping: zero-flow=identity, non-zero-flow changes output")
+
+
+def case_gaussian_head_channels(ctx: SmokeContext) -> None:
+    _banner("GaussianHead Output Channels")
+    from models.gaussian_head import GaussianHead
+
+    device = ctx.device
+    B, C, H, W = 2, 64, 16, 16
+    head = GaussianHead(in_channels=C).to(device).eval()
+
+    x = torch.randn(B, C, H, W, device=device)
+    with torch.no_grad():
+        out = head(x)
+
+    expected_keys = {'depth', 'depth_scale', 'xy_offset', 'scale_xy', 'rotation', 'color', 'opacity'}
+    if set(out.keys()) != expected_keys:
+        raise AssertionError(f"GaussianHead output keys mismatch: {set(out.keys())} vs {expected_keys}")
+    if out['rotation'].shape != (B, 4, H, W):
+        raise AssertionError(f"rotation shape: expected (B,4,H,W), got {tuple(out['rotation'].shape)}")
+    opacity = out['opacity']
+    if not (opacity.min() >= 0 and opacity.max() <= 1):
+        raise AssertionError(f"Opacity out of [0,1]: min={float(opacity.min()):.4f}, max={float(opacity.max()):.4f}")
+    color = out['color']
+    if not (color.min() >= 0 and color.max() <= 1):
+        raise AssertionError(f"Color out of [0,1]: min={float(color.min()):.4f}, max={float(color.max()):.4f}")
+    rot_norms = out['rotation'].norm(dim=1)  # (B, H, W)
+    if not torch.allclose(rot_norms, torch.ones_like(rot_norms), atol=1e-5):
+        raise AssertionError(f"Rotation not unit quaternion: max_err={float((rot_norms - 1).abs().max()):.2e}")
+    for k, v in out.items():
+        _assert_finite(f"gaussian_head_{k}", v)
+    print(f"gaussian head: keys={sorted(out.keys())}, rotation_shape={tuple(out['rotation'].shape)}, "
+          f"opacity=[{float(opacity.min()):.3f},{float(opacity.max()):.3f}]")
+
+
+def case_curriculum_schedule(ctx: SmokeContext) -> None:
+    _banner("Curriculum Schedule")
+    from data.utils import get_curriculum_settings
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    cfg.train = _Cfg()
+    cfg.train.epochs = 100
+    cfg.train.curriculum_fraction = 0.55  # default
+
+    # With 100 epochs: curriculum_epochs=55, stage_len=11
+    expected = {
+        0:  ('vimeo_only', None, None),
+        5:  ('vimeo_only', None, None),
+        11: ('x4k_only',  [5],  [4]),
+        22: ('x4k_only',  [31], [3]),
+        33: ('x4k_only',  [31], [2]),
+        44: ('mixed',     [5, 31, 31], [4, 3, 2]),
+        55: ('mixed',     [5, 31, 31], [4, 3, 2]),
+        99: ('mixed',     [5, 31, 31], [4, 3, 2]),
+    }
+
+    for epoch, (exp_mode, exp_steps, exp_nf) in expected.items():
+        s = get_curriculum_settings(cfg, epoch)
+        if s['mode'] != exp_mode:
+            raise AssertionError(f"epoch={epoch}: expected mode={exp_mode!r}, got {s['mode']!r}")
+        if exp_steps is not None and s.get('x4k_steps') != exp_steps:
+            raise AssertionError(f"epoch={epoch}: expected x4k_steps={exp_steps}, got {s.get('x4k_steps')}")
+        if exp_nf is not None and s.get('x4k_n_frames') != exp_nf:
+            raise AssertionError(f"epoch={epoch}: expected x4k_n_frames={exp_nf}, got {s.get('x4k_n_frames')}")
+
+    print("curriculum schedule: all stage transitions correct for 100-epoch run")
+    for ep in [0, 11, 22, 33, 44, 55, 99]:
+        s = get_curriculum_settings(cfg, ep)
+        print(f"  epoch={ep:3d}: mode={s['mode']!r:12s} steps={s.get('x4k_steps')} n_frames={s.get('x4k_n_frames')}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GS-Mamba smoke tests")
     parser.add_argument("--device", type=str, default="auto", help="auto|cuda|cuda:0|cpu")
@@ -467,6 +612,10 @@ def main() -> int:
         ("single_optimizer_step", case_backward_step),
         ("train_help", case_train_help),
         ("validation_synthetic_loop", case_validation_synthetic),
+        ("slerp_correctness", case_slerp_correctness),
+        ("flow_guided_warping", case_flow_guided_warping),
+        ("gaussian_head_channels", case_gaussian_head_channels),
+        ("curriculum_schedule", case_curriculum_schedule),
     ]
 
     if args.datasets in ("vimeo", "all"):

@@ -659,6 +659,11 @@ def main():
                         help='Keep incomplete mixed-mode batches.')
     parser.add_argument('--mode', type=str, default='vimeo_only',
                         choices=['vimeo_only', 'x4k_only', 'mixed'])
+    parser.add_argument('--x4k_fraction', type=float, default=None,
+                        help='Fraction of X4K samples to draw per epoch (0.0-1.0). '
+                             'E.g., 0.1 draws a random 10%% subset each epoch, '
+                             'which is different per epoch. Speeds up x4k_only / mixed training '
+                             'when X4K generates millions of samples. Default: 1.0 (all samples).')
 
     # Evaluation
     parser.add_argument('--eval_full_every', type=int, default=10,
@@ -809,6 +814,7 @@ def main():
         mode=args.mode if not args.use_curriculum else 'vimeo_only',
         x4k_steps=config.data.x4k_steps if not args.use_curriculum else None,
         x4k_n_frames=config.data.x4k_n_frames if not args.use_curriculum else None,
+        x4k_fraction=config.data.x4k_epoch_fraction,
     )
 
     scheduler = get_scheduler(optimizer, config)
@@ -856,6 +862,8 @@ def main():
         print(f"Mixed drop_last: {config.data.drop_last_mixed}")
         if not args.use_curriculum and args.mode in ['x4k_only', 'mixed']:
             print(f"  -> TEMPO-style: {list(zip(config.data.x4k_steps, config.data.x4k_n_frames))}")
+        if config.data.x4k_epoch_fraction < 1.0:
+            print(f"X4K epoch fraction: {config.data.x4k_epoch_fraction:.0%} (random subset drawn each epoch)")
 
     for epoch in range(start_epoch, config.train.epochs):
         # Update dataloader based on curriculum
@@ -871,6 +879,7 @@ def main():
                 mode=curriculum.get('mode', 'vimeo_only'),
                 x4k_steps=curriculum.get('x4k_steps'),
                 x4k_n_frames=curriculum.get('x4k_n_frames'),
+                x4k_fraction=config.data.x4k_epoch_fraction,
             )
             current_mode = curriculum.get('mode', 'vimeo_only')
         else:

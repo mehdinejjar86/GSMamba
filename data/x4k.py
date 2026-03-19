@@ -320,14 +320,23 @@ class X4KBatchSampler(data.Sampler):
         batch_size: int,
         shuffle: bool = True,
         drop_last: bool = False,
+        fraction: float = 1.0,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.fraction = max(0.0, min(1.0, fraction))
 
         # Get samples grouped by N
         self.samples_by_n = dataset.samples_by_n
+
+    def _subsample(self, indices: list) -> list:
+        """Return at most fraction * len(indices) samples (minimum: one full batch)."""
+        if self.fraction >= 1.0:
+            return indices
+        k = max(self.batch_size, int(self.fraction * len(indices)))
+        return indices[:k]
 
     def __iter__(self):
         batches = []
@@ -337,6 +346,8 @@ class X4KBatchSampler(data.Sampler):
             if self.shuffle:
                 indices = indices.copy()
                 random.shuffle(indices)
+
+            indices = self._subsample(indices)
 
             # Create batches
             for i in range(0, len(indices), self.batch_size):
@@ -353,8 +364,9 @@ class X4KBatchSampler(data.Sampler):
     def __len__(self):
         total = 0
         for indices in self.samples_by_n.values():
-            n_batches = len(indices) // self.batch_size
-            if not self.drop_last and len(indices) % self.batch_size > 0:
+            n = max(self.batch_size, int(self.fraction * len(indices))) if self.fraction < 1.0 else len(indices)
+            n_batches = n // self.batch_size
+            if not self.drop_last and n % self.batch_size > 0:
                 n_batches += 1
             total += n_batches
         return total
@@ -377,6 +389,7 @@ class DistributedX4KBatchSampler(data.Sampler):
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
+        fraction: float = 1.0,
     ):
         import torch.distributed as dist
 
@@ -399,6 +412,7 @@ class DistributedX4KBatchSampler(data.Sampler):
         self.drop_last = drop_last
         self.seed = seed
         self.epoch = 0
+        self.fraction = max(0.0, min(1.0, fraction))
 
         self.samples_by_n = dataset.samples_by_n
 
@@ -418,6 +432,11 @@ class DistributedX4KBatchSampler(data.Sampler):
             if self.shuffle:
                 perm = torch.randperm(len(indices), generator=g).tolist()
                 indices = [indices[i] for i in perm]
+
+            # Subsample fraction of indices (after shuffle so subset changes each epoch)
+            if self.fraction < 1.0:
+                k = max(self.batch_size, int(self.fraction * len(indices)))
+                indices = indices[:k]
 
             # Create batches
             for i in range(0, len(indices), self.batch_size):
@@ -449,8 +468,9 @@ class DistributedX4KBatchSampler(data.Sampler):
     def __len__(self):
         total = 0
         for indices in self.samples_by_n.values():
-            n_batches = len(indices) // self.batch_size
-            if not self.drop_last and len(indices) % self.batch_size > 0:
+            n = max(self.batch_size, int(self.fraction * len(indices))) if self.fraction < 1.0 else len(indices)
+            n_batches = n // self.batch_size
+            if not self.drop_last and n % self.batch_size > 0:
                 n_batches += 1
             total += n_batches
         return (total + self.num_replicas - 1) // self.num_replicas

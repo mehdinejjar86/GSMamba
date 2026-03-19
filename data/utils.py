@@ -113,6 +113,7 @@ def create_train_loader(
     mode: Literal["vimeo_only", "x4k_only", "mixed"] = "vimeo_only",
     x4k_steps: Optional[List[int]] = None,
     x4k_n_frames: Optional[List[int]] = None,
+    x4k_fraction: Optional[float] = None,
 ) -> DataLoader:
     """
     Create training dataloader with proper configuration.
@@ -144,6 +145,8 @@ def create_train_loader(
         x4k_steps = getattr(data_cfg, 'x4k_steps', [5, 31, 31])
     if x4k_n_frames is None:
         x4k_n_frames = getattr(data_cfg, 'x4k_n_frames', [4, 3, 2])
+    if x4k_fraction is None:
+        x4k_fraction = float(getattr(data_cfg, 'x4k_epoch_fraction', 1.0))
 
     if mode == "vimeo_only":
         # Vimeo triplet (N=2)
@@ -203,6 +206,7 @@ def create_train_loader(
                 rank=rank,
                 shuffle=True,
                 drop_last=True,
+                fraction=x4k_fraction,
             )
         else:
             sampler = X4KBatchSampler(
@@ -210,6 +214,7 @@ def create_train_loader(
                 batch_size=batch_size,
                 shuffle=True,
                 drop_last=True,
+                fraction=x4k_fraction,
             )
 
         loader = DataLoader(
@@ -258,8 +263,14 @@ def create_train_loader(
 
         concat = ConcatDataset([vimeo] + x4k_subsets)
         raw_ratios = getattr(data_cfg, 'dataset_ratios', [0.7, 0.3])
-        ratios = _expand_mixed_ratios(raw_ratios, x4k_group_sizes)
-        dataset_sizes = [len(vimeo)] + x4k_group_sizes
+        # Apply x4k_fraction: tell the sampler to draw only this fraction of each X4K group.
+        # PureBatchSampler uses range(size) internally, so reducing the sizes here
+        # limits how many X4K samples are drawn per epoch (different random subset each epoch).
+        sampler_x4k_sizes = [
+            max(batch_size, int(x4k_fraction * s)) for s in x4k_group_sizes
+        ] if x4k_fraction < 1.0 else x4k_group_sizes
+        ratios = _expand_mixed_ratios(raw_ratios, sampler_x4k_sizes)
+        dataset_sizes = [len(vimeo)] + sampler_x4k_sizes
 
         if world_size > 1:
             sampler = DistributedPureBatchSampler(
