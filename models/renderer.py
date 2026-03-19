@@ -102,25 +102,6 @@ def create_canonical_camera(
     )
 
 
-def rotation_to_quaternion(rotation_angle: torch.Tensor) -> torch.Tensor:
-    """
-    Convert 2D rotation angle to quaternion (rotation around z-axis).
-
-    Args:
-        rotation_angle: Rotation angle in radians (B, N, 1) or (N, 1)
-
-    Returns:
-        Quaternion (w, x, y, z) with shape (..., 4)
-    """
-    # Rotation around z-axis
-    half_angle = rotation_angle / 2
-    w = torch.cos(half_angle)
-    x = torch.zeros_like(half_angle)
-    y = torch.zeros_like(half_angle)
-    z = torch.sin(half_angle)
-
-    return torch.cat([w, x, y, z], dim=-1)
-
 
 class GaussianRenderer(nn.Module):
     """
@@ -212,9 +193,8 @@ class GaussianRenderer(nn.Module):
         # Scale: already positive from softplus in GaussianHead
         scales = gaussians['scale'].float()  # (N, 3)
 
-        # Rotation: convert angle to quaternion
-        rotations = rotation_to_quaternion(gaussians['rotation'].float())  # (N, 4)
-        rotations = F.normalize(rotations, dim=-1)
+        # Rotation: quaternion already predicted and normalized by GaussianHead
+        rotations = F.normalize(gaussians['rotation'].float(), dim=-1)  # (N, 4)
 
         # Opacity
         opacities = gaussians['opacity'].float()  # (N, 1)

@@ -48,10 +48,10 @@ class GaussianInterpolator(nn.Module):
         # Parameter embedding dimensions
         xyz_dim = 3
         scale_dim = 3
-        rot_dim = 1
+        rot_dim = 4      # Full SO(3) quaternion
         opacity_dim = 1
         color_dim = 3
-        total_dim = xyz_dim + scale_dim + rot_dim + opacity_dim + color_dim  # 11
+        total_dim = xyz_dim + scale_dim + rot_dim + opacity_dim + color_dim  # 14
 
         # Timestep embedding
         self.time_embed = nn.Sequential(
@@ -182,6 +182,7 @@ class GaussianInterpolator(nn.Module):
             gaussians: List[Dict[str, torch.Tensor]],
             t: Union[float, torch.Tensor],
             timestamps: Optional[torch.Tensor] = None,
+            flow: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Interpolate Gaussians to query timestep.
@@ -193,6 +194,9 @@ class GaussianInterpolator(nn.Module):
             t: Query timestep in [0, 1] (scalar or (B,) tensor)
             timestamps: Optional explicit frame timestamps (B, N) or (N,)
                        If None, assumes uniform spacing [0, 1/(N-1), 2/(N-1), ..., 1]
+            flow: Optional optical flow (B, 4, H, W) with fwd=[:, :2] and bwd=[:, 2:4].
+                  When provided, bounding-frame Gaussian attribute maps are warped to t
+                  before interpolation for better correspondence at motion boundaries.
 
         Returns:
             Interpolated Gaussian dict at timestep t
@@ -222,12 +226,21 @@ class GaussianInterpolator(nn.Module):
         g0 = self._gather_gaussians(gaussians, idx0)
         g1 = self._gather_gaussians(gaussians, idx1)
 
-        # Linear interpolation baseline
+        # Fix C: Flow-guided correspondence warp
+        if flow is not None:
+            H, W = flow.shape[2], flow.shape[3]
+            fwd_flow = flow[:, :2]   # f_a → t
+            bwd_flow = flow[:, 2:4]  # f_b → t
+            for key in list(g0.keys()):
+                g0[key] = self._from_map(self._warp_map(self._to_map(g0[key], H, W), fwd_flow))
+                g1[key] = self._from_map(self._warp_map(self._to_map(g1[key], H, W), bwd_flow))
+
+        # Interpolation baseline
         alpha_expanded = alpha.view(B, 1, 1)
 
         xyz_linear = (1 - alpha_expanded) * g0['xyz'] + alpha_expanded * g1['xyz']
         scale_linear = (1 - alpha_expanded) * g0['scale'] + alpha_expanded * g1['scale']
-        rot_linear = self._angle_interp(g0['rotation'], g1['rotation'], alpha_expanded)
+        rot_linear = self._slerp(g0['rotation'], g1['rotation'], alpha_expanded)
         opacity_linear = (1 - alpha_expanded) * g0['opacity'] + alpha_expanded * g1['opacity']
         color_linear = (1 - alpha_expanded) * g0['color'] + alpha_expanded * g1['color']
 
@@ -241,10 +254,9 @@ class GaussianInterpolator(nn.Module):
             }
 
         # Learned residual prediction
-        # Concatenate all parameters from both bounding frames
         params_0 = torch.cat([g0['xyz'], g0['scale'], g0['rotation'], g0['opacity'], g0['color']], dim=-1)
         params_1 = torch.cat([g1['xyz'], g1['scale'], g1['rotation'], g1['opacity'], g1['color']], dim=-1)
-        params_concat = torch.cat([params_0, params_1], dim=-1)  # (B, num_points, 22)
+        params_concat = torch.cat([params_0, params_1], dim=-1)  # (B, num_points, 28)
 
         # Embed parameters
         h = self.param_embed(params_concat)  # (B, num_points, hidden_dim)
@@ -265,34 +277,82 @@ class GaussianInterpolator(nn.Module):
         opacity_residual = self.opacity_decoder(h)
         color_residual = self.color_decoder(h)
 
-        # Add residuals to linear interpolation
+        # Add residuals to interpolation baseline
         return {
             'xyz': xyz_linear + xyz_residual,
             'scale': F.softplus(scale_linear + scale_residual),
-            'rotation': rot_linear + 0.1 * rot_residual,  # Small rotation adjustment
+            'rotation': F.normalize(rot_linear + 0.1 * rot_residual, dim=-1),  # re-normalize quaternion
             'opacity': torch.sigmoid(torch.logit(opacity_linear.clamp(1e-6, 1-1e-6)) + opacity_residual),
             'color': torch.sigmoid(torch.logit(color_linear.clamp(1e-6, 1-1e-6)) + color_residual),
         }
 
     @staticmethod
-    def _angle_interp(a0: torch.Tensor, a1: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    def _slerp(q0: torch.Tensor, q1: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         """
-        Interpolate angles handling wrap-around.
+        Spherical linear interpolation between unit quaternions.
 
         Args:
-            a0, a1: Start and end angles
-            alpha: Interpolation weight
+            q0: Start quaternions (..., 4)
+            q1: End quaternions (..., 4)
+            alpha: Interpolation weight (..., 1) in [0, 1]
 
         Returns:
-            Interpolated angle
+            Interpolated unit quaternion (..., 4)
         """
-        # Compute shortest path
-        diff = a1 - a0
+        dot = (q0 * q1).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        # Ensure shortest arc
+        q1 = torch.where(dot < 0, -q1, q1)
+        dot = dot.abs()
+        omega = torch.acos(dot.clamp(max=1.0 - 1e-6))
+        sin_omega = torch.sin(omega).clamp(min=1e-6)
+        # Fall back to linear interp when quaternions are nearly identical
+        slerp = (torch.sin((1 - alpha) * omega) / sin_omega * q0
+                 + torch.sin(alpha * omega) / sin_omega * q1)
+        lerp = (1 - alpha) * q0 + alpha * q1
+        return F.normalize(torch.where(sin_omega < 1e-6, lerp, slerp), dim=-1)
 
-        # Wrap to [-pi, pi]
-        diff = torch.remainder(diff + math.pi, 2 * math.pi) - math.pi
+    @staticmethod
+    def _to_map(tensor: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """Reshape (B, N, C) -> (B, C, H, W)."""
+        B, N, C = tensor.shape
+        return tensor.permute(0, 2, 1).reshape(B, C, H, W)
 
-        return a0 + alpha * diff
+    @staticmethod
+    def _from_map(tensor: torch.Tensor) -> torch.Tensor:
+        """Reshape (B, C, H, W) -> (B, N, C)."""
+        B, C, H, W = tensor.shape
+        return tensor.reshape(B, C, -1).permute(0, 2, 1)
+
+    @staticmethod
+    def _warp_map(feat_map: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
+        """
+        Warp a spatial feature map by optical flow.
+
+        Args:
+            feat_map: (B, C, H, W)
+            flow: (B, 2, H, W) displacement in pixels (dx, dy)
+
+        Returns:
+            Warped feature map (B, C, H, W)
+        """
+        B, C, H, W = feat_map.shape
+        # Normalize pixel displacements to [-1, 1]
+        flow_norm = torch.stack([
+            flow[:, 0] / (W / 2),
+            flow[:, 1] / (H / 2),
+        ], dim=1)  # (B, 2, H, W)
+
+        # Base identity grid
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=feat_map.device, dtype=feat_map.dtype),
+            torch.linspace(-1, 1, W, device=feat_map.device, dtype=feat_map.dtype),
+            indexing='ij',
+        )
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)  # (B, H, W, 2)
+
+        sampling_grid = grid + flow_norm.permute(0, 2, 3, 1)  # (B, H, W, 2)
+        return F.grid_sample(feat_map, sampling_grid, mode='bilinear',
+                             padding_mode='border', align_corners=True)
 
 
 class SSMGaussianInterpolator(nn.Module):
@@ -311,7 +371,7 @@ class SSMGaussianInterpolator(nn.Module):
 
     def __init__(
             self,
-            gaussian_dim: int = 11,
+            gaussian_dim: int = 14,
             hidden_dim: int = 128,
             d_state: int = 16,
             num_layers: int = 2,
@@ -426,11 +486,11 @@ class SSMGaussianInterpolator(nn.Module):
         out = self.output_proj(h_interp)  # (B * num_points, gaussian_dim)
         out = out.view(B, num_points, self.gaussian_dim)
 
-        # Split into parameters
+        # Split into parameters (xyz=3, scale=3, rotation=4, opacity=1, color=3 → total 14)
         return {
             'xyz': out[..., :3],
             'scale': F.softplus(out[..., 3:6]),
-            'rotation': out[..., 6:7],
-            'opacity': torch.sigmoid(out[..., 7:8]),
-            'color': torch.sigmoid(out[..., 8:11]),
+            'rotation': F.normalize(out[..., 6:10], dim=-1),  # unit quaternion
+            'opacity': torch.sigmoid(out[..., 10:11]),
+            'color': torch.sigmoid(out[..., 11:14]),
         }

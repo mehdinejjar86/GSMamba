@@ -40,13 +40,19 @@ class GSMamba(nn.Module):
         config: GSMambaConfig with model parameters
     """
 
-    def __init__(self, config: Optional[GSMambaConfig] = None):
+    def __init__(self, config: Optional[GSMambaConfig] = None, flow_net=None):
         super().__init__()
 
         if config is None:
             config = GSMambaConfig()
 
         self.config = config
+
+        # Optional VFIMamba flow network for flow-guided Gaussian correspondence.
+        # Always frozen. Active only during Vimeo midpoint (t=0.5) training phases;
+        # train.py toggles flow_active alongside criterion.use_gflow.
+        self.flow_net = flow_net
+        self.flow_active: bool = (flow_net is not None)
 
         # 1. Feature Encoder (shared SS2D backbone)
         self.encoder = FeatureEncoder(
@@ -182,6 +188,7 @@ class GSMamba(nn.Module):
             gaussians_list: List[Dict[str, torch.Tensor]],
             t: Union[float, torch.Tensor],
             timestamps: Optional[torch.Tensor] = None,
+            flow: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Interpolate Gaussians to timestep t and render.
@@ -190,12 +197,14 @@ class GSMamba(nn.Module):
             gaussians_list: List of N Gaussian dicts
             t: Query timestep in [0, 1]
             timestamps: Frame timestamps (B, N)
+            flow: Optional (B, 4, H, W) optical flow from VFIMamba
+                  (fwd=[:, :2], bwd=[:, 2:4]) for flow-guided Gaussian warp.
 
         Returns:
             Dict with rendered image and depth
         """
-        # Interpolate Gaussians
-        gaussians_t = self.interpolator(gaussians_list, t, timestamps)
+        # Interpolate Gaussians (with optional flow-guided warp)
+        gaussians_t = self.interpolator(gaussians_list, t, timestamps, flow=flow)
 
         # Render
         render_output = self.renderer(gaussians_t)
@@ -237,42 +246,54 @@ class GSMamba(nn.Module):
         if timestamps is None:
             timestamps = torch.linspace(0, 1, N, device=device).unsqueeze(0).expand(B, -1)
 
+        # Resolve t to a (B,) tensor early — needed for bounding-frame lookup
+        if isinstance(t, float):
+            t_tensor = torch.tensor([t], device=device).expand(B)
+        else:
+            t_tensor = t.to(device=device)
+            if t_tensor.dim() == 0:
+                t_tensor = t_tensor.expand(B)
+            elif t_tensor.dim() == 2 and t_tensor.shape[1] == 1:
+                t_tensor = t_tensor.squeeze(1)
+
+        # Find two nearest frames to timestep t (used for flow and refinement)
+        t_expanded = t_tensor.view(B, 1)
+        diffs = (timestamps - t_expanded).abs()
+        _, nearest_indices = diffs.topk(2, dim=1, largest=False)
+        idx0 = nearest_indices[:, 0]   # (B,)
+        idx1 = nearest_indices[:, 1]   # (B,)
+
+        nearest_frames = torch.stack([
+            torch.stack([frames[b, idx0[b]], frames[b, idx1[b]]], dim=0)
+            for b in range(B)
+        ], dim=0)  # (B, 2, C, H, W)
+
+        # Compute optical flow between bounding frames (Fix C: "compute once, use twice")
+        # Phase 1: flow_net frozen — provides correspondence signal for warping + loss
+        # Phase 2: flow_net unfrozen — gradients flow through for joint optimisation
+        flow = None
+        if self.flow_net is not None and self.flow_active:
+            f_a = nearest_frames[:, 0]  # (B, 3, H, W)
+            f_b = nearest_frames[:, 1]  # (B, 3, H, W)
+            x_flow = torch.cat([f_a, f_b], dim=1)  # (B, 6, H, W)
+            flow_list, _, _, _ = self.flow_net(x_flow)
+            flow = flow_list[-1]  # (B, 4, H, W): fwd=[:, :2], bwd=[:, 2:4]
+
         # Encode frames and get Gaussians
         fused_features, gaussians_list = self.encode_frames(frames, timestamps)
 
-        # Interpolate and render
-        render_output = self.interpolate_and_render(gaussians_list, t, timestamps)
+        # Interpolate (with flow-guided warp if available) and render
+        render_output = self.interpolate_and_render(gaussians_list, t_tensor, timestamps, flow=flow)
 
         rendered = render_output['render']
         depth = render_output['depth']
 
         # Refinement
         if self.use_refinement:
-            # Find two nearest frames to timestep t
-            if isinstance(t, float):
-                t_tensor = torch.tensor([t], device=device).expand(B)
-            else:
-                t_tensor = t
-
-            # Get nearest frame indices
-            t_expanded = t_tensor.view(B, 1)
-            diffs = (timestamps - t_expanded).abs()
-            _, nearest_indices = diffs.topk(2, dim=1, largest=False)
-
-            # Gather nearest frames
-            idx0 = nearest_indices[:, 0]
-            idx1 = nearest_indices[:, 1]
-
-            nearest_frames = torch.stack([
-                torch.stack([frames[b, idx0[b]], frames[b, idx1[b]]], dim=0)
-                for b in range(B)
-            ], dim=0)  # (B, 2, C, H, W)
-
             # Compute opacity map (sum of Gaussian opacities projected to image)
             opacity = render_output['gaussians']['opacity'].mean(dim=1, keepdim=True)  # (B, 1)
             opacity_map = torch.ones(B, 1, H, W, device=device) * opacity.view(B, 1, 1, 1)
 
-            # Refine
             pred = self.refine(
                 rendered=rendered,
                 depth=depth,
@@ -288,6 +309,9 @@ class GSMamba(nn.Module):
             'render': rendered,
             'depth': depth,
         }
+
+        if flow is not None:
+            output['flow'] = flow  # (B, 4, H, W) — passed to loss as use_precomputed_flow
 
         if return_intermediates:
             output['gaussians'] = render_output['gaussians']

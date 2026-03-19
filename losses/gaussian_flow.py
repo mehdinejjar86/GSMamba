@@ -42,9 +42,9 @@ class GaussianFlowLoss(nn.Module):
 
         self.flow_net = flow_net
         if flow_net is not None:
+            # Set to eval initially; Phase 2 training in train.py unfreezes via the model's
+            # copy of flow_net — do not set requires_grad here so that doesn't conflict.
             self.flow_net.eval()
-            for param in self.flow_net.parameters():
-                param.requires_grad = False
 
         self.H, self.W = image_size
         self.focal_length = focal_length if focal_length else (self.H + self.W) / 2

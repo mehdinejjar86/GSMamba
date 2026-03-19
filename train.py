@@ -202,6 +202,7 @@ def train_one_epoch(
     device: torch.device,
     rank: int = 0,
     world_size: int = 1,
+    global_step: int = 0,
 ):
     """Train for one epoch."""
     model.train()
@@ -256,6 +257,7 @@ def train_one_epoch(
             )
 
             # Compute loss
+            # Pass precomputed flow from model (avoids a second flow_net forward pass)
             losses = criterion(
                 pred=output['pred'],
                 target=target,
@@ -265,6 +267,7 @@ def train_one_epoch(
                 gaussians_list=output.get('all_gaussians', []),
                 gaussians_interp=output.get('gaussians', {}),
                 t=target_time,
+                use_precomputed_flow=output.get('flow'),
             )
 
             loss = losses['total']
@@ -295,19 +298,21 @@ def train_one_epoch(
         total_ssim += batch_ssim
 
         # Keep detailed TensorBoard curves without per-step CLI printing.
+        # Use persistent global_step so the x-axis is monotonic even when
+        # the curriculum recreates the dataloader with a different length.
+        step = global_step + batch_idx
         if writer is not None:
-            global_step = epoch * len(dataloader) + batch_idx
-            writer.add_scalar('train/loss', loss.item(), global_step)
-            writer.add_scalar('train/lr', last_lr, global_step)
-            writer.add_scalar('train/psnr', batch_psnr, global_step)
-            writer.add_scalar('train/ssim', batch_ssim, global_step)
+            writer.add_scalar('train/loss', loss.item(), step)
+            writer.add_scalar('train/lr', last_lr, step)
+            writer.add_scalar('train/psnr', batch_psnr, step)
+            writer.add_scalar('train/ssim', batch_ssim, step)
 
         for key, value in losses.items():
             if key == 'total':
                 continue
             component_sums[key] = component_sums.get(key, 0.0) + value.item()
             if writer is not None:
-                writer.add_scalar(f'train/{key}', value.item(), global_step)
+                writer.add_scalar(f'train/{key}', value.item(), step)
 
         if use_tqdm:
             iterator.set_postfix({
@@ -319,6 +324,20 @@ def train_one_epoch(
 
     if use_tqdm:
         iterator.close()
+
+    # Reduce metrics across all ranks so rank 0 logs global averages,
+    # not just its own 1/world_size slice of the data.
+    if world_size > 1 and dist.is_initialized():
+        metrics = torch.tensor(
+            [total_loss, total_psnr, total_ssim, float(num_batches)],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        total_loss = metrics[0].item()
+        total_psnr = metrics[1].item()
+        total_ssim = metrics[2].item()
+        num_batches = int(metrics[3].item())
 
     # Log uncertainty weights at end of epoch
     if rank == 0:
@@ -359,7 +378,7 @@ def train_one_epoch(
             print(f"Epoch {epoch} uncertainty weights ({'warmup' if is_warmup else 'learned'}): {weight_str}")
 
     avg_loss = total_loss / max(num_batches, 1)
-    return avg_loss
+    return avg_loss, global_step + num_batches
 
 
 @torch.no_grad()
@@ -705,8 +724,21 @@ def main():
     # Set seed
     set_seed(config.seed + rank, config.deterministic)
 
+    # Load VFIMamba flow network before model construction so it can be embedded in the model
+    flow_net = None
+    if args.flow_ckpt:
+        from losses.flow_net_loader import load_vfimamba_flow_net
+        flow_net = load_vfimamba_flow_net(
+            ckpt_path=args.flow_ckpt,
+            model_size=args.flow_model_size,
+            device=str(device),
+        )
+        if is_main:
+            print(f"VFIMamba-{args.flow_model_size} loaded for flow-guided Gaussian correspondence + Flow loss")
+
     # Create model (use updated model config from full config)
-    model = GSMamba(config.model)
+    # flow_net is embedded in the model for Phase 1 (frozen) and Phase 2 (unfrozen) joint training
+    model = GSMamba(config.model, flow_net=flow_net)
     model = model.to(device)
 
     if is_main:
@@ -728,18 +760,6 @@ def main():
             )
         else:
             model = DDP(model, find_unused_parameters=False)
-
-    # Load VFIMamba flow network for Gaussian Flow Loss (if checkpoint provided)
-    flow_net = None
-    if args.flow_ckpt:
-        from losses.flow_net_loader import load_vfimamba_flow_net
-        flow_net = load_vfimamba_flow_net(
-            ckpt_path=args.flow_ckpt,
-            model_size=args.flow_model_size,
-            device=str(device),
-        )
-        if is_main:
-            print(f"Gaussian Flow supervision enabled with VFIMamba-{args.flow_model_size}")
 
     # Create loss function with uncertainty-based weighting
     criterion = build_loss(config.loss, config.model, flow_net=flow_net)
@@ -826,6 +846,7 @@ def main():
             print(f"Resumed from epoch {start_epoch}")
 
     # Training loop
+    global_step = 0  # Monotonic step counter for TensorBoard (survives dataloader changes)
     if is_main:
         print(f"\nStarting training for {config.train.epochs} epochs")
         print(f"Curriculum: {'enabled' if args.use_curriculum else 'disabled'}")
@@ -856,9 +877,15 @@ def main():
             current_mode = args.mode
 
         # Toggle guided-flow supervision by training phase/mode.
+        # VFIMamba was trained at t=0.5 only, so flow guidance is valid ONLY for
+        # Vimeo midpoint interpolation. Both the loss and the model warping are gated.
         if flow_policy_enabled:
             should_use_gflow = (current_mode == 'vimeo_only' and vimeo_midpoint_only)
             criterion.use_gflow = should_use_gflow
+            # Keep model flow_active in sync with loss (same Vimeo-only constraint)
+            model_unwrapped = model.module if isinstance(model, DDP) else model
+            if hasattr(model_unwrapped, 'flow_active'):
+                model_unwrapped.flow_active = should_use_gflow
             if is_main and criterion.use_gflow != prev_use_gflow:
                 state = "enabled" if criterion.use_gflow else "disabled"
                 print(
@@ -874,9 +901,10 @@ def main():
             train_loader.batch_sampler.set_epoch(epoch)
 
         # Train
-        train_loss = train_one_epoch(
+        train_loss, global_step = train_one_epoch(
             model, criterion, train_loader, optimizer, scheduler, scaler,
-            epoch, config, writer, device, rank, world_size
+            epoch, config, writer, device, rank, world_size,
+            global_step=global_step,
         )
 
         if scheduler is not None:
@@ -916,6 +944,11 @@ def main():
                 model, optimizer, scheduler, scaler,
                 epoch, config, output_dir, is_best
             )
+
+        # Sync all ranks after checkpoint save so no rank races ahead
+        # while rank 0 is still writing to disk.
+        if world_size > 1:
+            dist.barrier()
 
         # Full benchmark evaluation (less frequent)
         # Includes Vimeo test and X4K cascaded 8x

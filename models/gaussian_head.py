@@ -18,12 +18,12 @@ class GaussianHead(nn.Module):
 
     Predicts 3D Gaussian parameters for each pixel from feature maps.
 
-    Output channels (11 total):
+    Output channels (14 total):
         - depth (1): Inverse depth (disparity) - positive via softplus
         - depth_scale (1): Gaussian extent in depth direction - positive via softplus
         - xy_offset (2): Sub-pixel position offset - unbounded (tanh for stability)
         - scale_xy (2): Gaussian extent in image plane - positive via softplus
-        - rotation (1): 2D rotation angle (simplified from quaternion)
+        - rotation (4): Unit quaternion (w, x, y, z) - L2-normalized
         - color (3): RGB color - [0,1] via sigmoid
         - opacity (1): Alpha transparency - [0,1] via sigmoid
 
@@ -42,12 +42,13 @@ class GaussianHead(nn.Module):
     XY_OFFSET_END = 4
     SCALE_XY_START = 4
     SCALE_XY_END = 6
-    ROTATION_IDX = 6
-    COLOR_START = 7
-    COLOR_END = 10
-    OPACITY_IDX = 10
+    ROTATION_START = 6   # Full SO(3) quaternion (w, x, y, z)
+    ROTATION_END = 10
+    COLOR_START = 10
+    COLOR_END = 13
+    OPACITY_IDX = 13
 
-    OUT_CHANNELS = 11
+    OUT_CHANNELS = 14
 
     def __init__(
             self,
@@ -86,8 +87,9 @@ class GaussianHead(nn.Module):
             # Scale XY
             self.conv2.bias[self.SCALE_XY_START:self.SCALE_XY_END] = math.log(math.exp(init_scale) - 1 + 1e-6)
 
-            # Rotation: start at 0
-            self.conv2.bias[self.ROTATION_IDX] = 0
+            # Rotation quaternion: initialize to identity [w=1, x=0, y=0, z=0]
+            self.conv2.bias[self.ROTATION_START] = 1.0   # w component
+            self.conv2.bias[self.ROTATION_START+1:self.ROTATION_END] = 0.0  # x, y, z
 
             # Color: sigmoid(0) = 0.5 (gray)
             self.conv2.bias[self.COLOR_START:self.COLOR_END] = 0
@@ -108,7 +110,7 @@ class GaussianHead(nn.Module):
                 - depth_scale: (B, 1, H, W) depth-direction scale
                 - xy_offset: (B, 2, H, W) sub-pixel offset
                 - scale_xy: (B, 2, H, W) in-plane scale
-                - rotation: (B, 1, H, W) rotation angle
+                - rotation: (B, 4, H, W) unit quaternion (w, x, y, z)
                 - color: (B, 3, H, W) RGB color
                 - opacity: (B, 1, H, W) alpha
         """
@@ -120,7 +122,7 @@ class GaussianHead(nn.Module):
         depth_scale = F.softplus(out[:, self.DEPTH_SCALE_IDX:self.DEPTH_SCALE_IDX+1])
         xy_offset = torch.tanh(out[:, self.XY_OFFSET_START:self.XY_OFFSET_END])
         scale_xy = F.softplus(out[:, self.SCALE_XY_START:self.SCALE_XY_END])
-        rotation = out[:, self.ROTATION_IDX:self.ROTATION_IDX+1]  # Unbounded angle
+        rotation = F.normalize(out[:, self.ROTATION_START:self.ROTATION_END], dim=1)  # Unit quaternion (B,4,H,W)
         color = torch.sigmoid(out[:, self.COLOR_START:self.COLOR_END])
         opacity = torch.sigmoid(out[:, self.OPACITY_IDX:self.OPACITY_IDX+1])
 
@@ -276,7 +278,7 @@ class GaussianAssembler(nn.Module):
             Dictionary with 3D Gaussian representation:
                 - xyz: (B, N, 3) 3D positions
                 - scale: (B, N, 3) 3D scales
-                - rotation: (B, N, 1) rotation angles
+                - rotation: (B, N, 4) unit quaternions (w, x, y, z)
                 - opacity: (B, N, 1) alpha values
                 - color: (B, N, 3) RGB colors
             where N = H * W
@@ -304,14 +306,16 @@ class GaussianAssembler(nn.Module):
         xyz = torch.cat([X, Y, Z], dim=1)  # (B, 3, H, W)
         xyz = xyz.view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
 
-        # Assemble 3D scale
+        # Assemble 3D scale (Fix B: depth-proportional scale)
         scale_xy = gaussian_params['scale_xy']  # (B, 2, H, W)
+        depth_norm = depth / depth.mean(dim=[2, 3], keepdim=True).clamp(min=1e-6)
+        scale_xy = scale_xy * depth_norm.detach()  # no gradient through depth into scale
         depth_scale = gaussian_params['depth_scale']  # (B, 1, H, W)
         scale = torch.cat([scale_xy, depth_scale], dim=1)  # (B, 3, H, W)
         scale = scale.view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
 
         # Flatten other parameters
-        rotation = gaussian_params['rotation'].view(B, 1, -1).permute(0, 2, 1)  # (B, N, 1)
+        rotation = gaussian_params['rotation'].view(B, 4, -1).permute(0, 2, 1)  # (B, N, 4)
         opacity = gaussian_params['opacity'].view(B, 1, -1).permute(0, 2, 1)  # (B, N, 1)
         color = gaussian_params['color'].view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
 

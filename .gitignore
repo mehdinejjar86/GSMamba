@@ -2,3 +2,6 @@
 *.log
 outputs/*
 vfimamba*/*
+gaussian-splatting*
+VFIMamba*
+.claude*

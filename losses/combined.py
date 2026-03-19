@@ -170,6 +170,7 @@ class GSMambaLoss(nn.Module):
             gaussians_list: List[Dict[str, torch.Tensor]],
             gaussians_interp: Dict[str, torch.Tensor],
             t: Union[float, torch.Tensor],
+            use_precomputed_flow: Optional[torch.Tensor] = None,
             return_components: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -233,11 +234,14 @@ class GSMambaLoss(nn.Module):
         # Note: gflow has its own decay schedule, compute raw loss here
         gflow_loss = torch.tensor(0.0, device=device)
         if self.use_gflow and self.gflow_loss is not None and len(gaussians_list) >= 2:
+            # use_precomputed_flow is (B, 4, H, W) from model; gflow_loss expects (B, 2, H, W)
+            precomp = use_precomputed_flow[:, :2] if use_precomputed_flow is not None else None
             gflow_loss = self.gflow_loss(
                 gaussians_list[0],
                 gaussians_list[-1],
                 input_frames[:, 0],
                 input_frames[:, -1],
+                use_precomputed_flow=precomp,
             )
         raw_losses['gflow'] = gflow_loss
 

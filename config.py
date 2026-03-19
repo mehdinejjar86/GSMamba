@@ -190,7 +190,7 @@ class GSMambaConfig:
     bidirectional: bool = True
 
     # Gaussian prediction head
-    gaussian_channels: int = 11  # depth, depth_scale, xy_offset(2), scale_xy(2), rotation, color(3), opacity
+    gaussian_channels: int = 14  # depth(1), depth_scale(1), xy_offset(2), scale_xy(2), rotation(4), color(3), opacity(1)
 
     # Renderer
     sh_degree: int = 0  # Start simple, can increase
