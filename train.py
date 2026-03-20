@@ -859,7 +859,7 @@ def main():
     best_psnr = 0.0
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if isinstance(model, DDP):
             model.module.load_state_dict(checkpoint['model'])
         else:

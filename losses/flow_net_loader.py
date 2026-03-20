@@ -118,7 +118,7 @@ def load_vfimamba_flow_net(
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    state_dict = torch.load(ckpt_path, map_location='cpu')
+    state_dict = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     if isinstance(state_dict, dict):
         if 'state_dict' in state_dict and isinstance(state_dict['state_dict'], dict):
             state_dict = state_dict['state_dict']
