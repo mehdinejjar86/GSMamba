@@ -860,14 +860,41 @@ def main():
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        if isinstance(model, DDP):
-            model.module.load_state_dict(checkpoint['model'])
-        else:
-            model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        _m = model.module if isinstance(model, DDP) else model
+        # Drop any keys whose shape doesn't match the current model (e.g. grid_x/grid_y
+        # are resolution-dependent buffers recomputed from image_size at build time).
+        _current_shapes = {k: v.shape for k, v in _m.state_dict().items()}
+        _ckpt_sd = checkpoint['model']
+        _shape_skipped = [
+            k for k, v in _ckpt_sd.items()
+            if k in _current_shapes and v.shape != _current_shapes[k]
+        ]
+        if _shape_skipped:
+            _ckpt_sd = {k: v for k, v in _ckpt_sd.items() if k not in _shape_skipped}
+            if is_main:
+                print(f"  Resume: skipped {len(_shape_skipped)} shape-mismatched keys (recomputed): {_shape_skipped}")
+        _incompatible = _m.load_state_dict(_ckpt_sd, strict=False)
+        if is_main and (_incompatible.missing_keys or _incompatible.unexpected_keys):
+            if _incompatible.missing_keys:
+                print(f"  Resume: missing keys (not in ckpt): {_incompatible.missing_keys}")
+            if _incompatible.unexpected_keys:
+                print(f"  Resume: unexpected keys (skipped): {_incompatible.unexpected_keys}")
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        except ValueError as _e:
+            if is_main:
+                print(f"  Resume: optimizer state skipped ({_e}) — starting with fresh optimizer")
         if scheduler and checkpoint.get('scheduler'):
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        scaler.load_state_dict(checkpoint['scaler'])
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            except Exception as _e:
+                if is_main:
+                    print(f"  Resume: scheduler state skipped ({_e})")
+        try:
+            scaler.load_state_dict(checkpoint['scaler'])
+        except Exception as _e:
+            if is_main:
+                print(f"  Resume: scaler state skipped ({_e})")
         start_epoch = checkpoint['epoch'] + 1
         if is_main:
             print(f"Resumed from epoch {start_epoch}")
