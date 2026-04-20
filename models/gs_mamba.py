@@ -51,7 +51,14 @@ class GSMamba(nn.Module):
         # Optional VFIMamba flow network for flow-guided Gaussian correspondence.
         # Always frozen. Active only during Vimeo midpoint (t=0.5) training phases;
         # train.py toggles flow_active alongside criterion.use_gflow.
-        self.flow_net = flow_net
+        #
+        # IMPORTANT: Store via object.__setattr__ so PyTorch's nn.Module does NOT
+        # register flow_net as a submodule.  DDP would otherwise add backward
+        # hooks for flow_net's parameters.  Since flow_net is frozen
+        # (requires_grad=False) and conditionally executed via flow_active,
+        # those hooks would desync NCCL collective sequence numbers across
+        # ranks when find_unused_parameters=False.
+        object.__setattr__(self, '_flow_net', flow_net)
         self.flow_active: bool = (flow_net is not None)
 
         # 1. Feature Encoder (shared SS2D backbone)
@@ -272,11 +279,11 @@ class GSMamba(nn.Module):
         # Phase 1: flow_net frozen — provides correspondence signal for warping + loss
         # Phase 2: flow_net unfrozen — gradients flow through for joint optimisation
         flow = None
-        if self.flow_net is not None and self.flow_active:
+        if self._flow_net is not None and self.flow_active:
             f_a = nearest_frames[:, 0]  # (B, 3, H, W)
             f_b = nearest_frames[:, 1]  # (B, 3, H, W)
             x_flow = torch.cat([f_a, f_b], dim=1)  # (B, 6, H, W)
-            flow_list, _, _, _ = self.flow_net(x_flow)
+            flow_list, _, _, _ = self._flow_net(x_flow)
             flow = flow_list[-1]  # (B, 4, H, W): fwd=[:, :2], bwd=[:, 2:4]
 
         # Encode frames and get Gaussians

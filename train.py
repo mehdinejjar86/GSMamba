@@ -258,7 +258,7 @@ def train_one_epoch(
         optimizer.zero_grad()
 
         use_amp = config.train.use_amp and device.type == 'cuda'
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.cuda.amp.autocast(enabled=use_amp):
             # Model forward
             output = model(
                 frames=frames,
@@ -283,20 +283,28 @@ def train_one_epoch(
 
             loss = losses['total']
 
-        # Skip batch if loss is non-finite (NaN/Inf from degenerate Gaussians or AMP overflow).
-        # Stepping the optimizer with a bad loss would corrupt all model weights.
+        # Handle non-finite loss (NaN/Inf from degenerate Gaussians or AMP overflow).
+        # IMPORTANT: We must NOT skip backward() because DDP ALLREDUCE happens
+        # during backward.  Skipping on one rank while others proceed would
+        # permanently desync NCCL collective sequence numbers across ranks.
+        # Instead we replace the loss with zero and let backward + scaler run
+        # normally (GradScaler detects inf and skips the optimizer step).
+        _skip_metrics = False
         if not torch.isfinite(loss):
-            optimizer.zero_grad(set_to_none=True)
             if rank == 0:
-                print(f"\nWarning: non-finite loss ({loss.item()}) at epoch {epoch} batch {batch_idx}, skipping step.")
-            continue
+                print(f"\nWarning: non-finite loss ({loss.item()}) at epoch {epoch} batch {batch_idx}, zeroing loss for DDP sync.")
+            _skip_metrics = True
+            # Replace with a zero-valued loss that still has a grad path through the model
+            # so DDP backward hooks (ALLREDUCE) fire on every rank.
+            loss = (output['pred'] * 0).sum()
 
-        with torch.no_grad():
-            pred_metrics = output['pred'].detach().float().clamp(0, 1)
-            target_metrics = target.detach().float().clamp(0, 1)
-            mse = ((pred_metrics - target_metrics) ** 2).mean(dim=[1, 2, 3])
-            batch_psnr = (-10 * torch.log10(mse + 1e-8)).mean().item()
-            batch_ssim = (1.0 - ssim_metric(pred_metrics, target_metrics)).item()
+        if not _skip_metrics:
+            with torch.no_grad():
+                pred_metrics = output['pred'].detach().float().clamp(0, 1)
+                target_metrics = target.detach().float().clamp(0, 1)
+                mse = ((pred_metrics - target_metrics) ** 2).mean(dim=[1, 2, 3])
+                batch_psnr = (-10 * torch.log10(mse + 1e-8)).mean().item()
+                batch_ssim = (1.0 - ssim_metric(pred_metrics, target_metrics)).item()
 
         # Backward pass
         scaler.scale(loss).backward()
@@ -309,6 +317,10 @@ def train_one_epoch(
 
         scaler.step(optimizer)
         scaler.update()
+
+        if _skip_metrics:
+            # Don't pollute running averages with the zeroed-out dummy loss.
+            continue
 
         total_loss += loss.item()
         num_batches += 1
@@ -542,6 +554,7 @@ def evaluate_full(
 
     # Get raw model (unwrap DDP if needed)
     raw_model = model.module if hasattr(model, 'module') else model
+    raw_model.eval()  # Freeze BatchNorm running stats during evaluation
     device = next(raw_model.parameters()).device
 
     results = {}
@@ -597,6 +610,12 @@ def evaluate_full(
                     writer.add_scalar('eval_full/x4k_ssim', r['ssim'], epoch)
         except Exception as e:
             print(f"X4K evaluation failed: {e}")
+
+    # Restore train mode and free GPU memory reserved during eval
+    # (especially important after X4K 4K OOM to avoid CUDA/NCCL corruption).
+    raw_model.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return results
 
@@ -690,6 +709,10 @@ def main():
                         help='Run full benchmark evaluation every N epochs')
     parser.add_argument('--skip_x4k_eval', action='store_true',
                         help='Skip X4K evaluation during training')
+    parser.add_argument('--x4k_scale', type=str, default=None,
+                        choices=['2k', '4k'],
+                        help='X4K evaluation resolution: 2k (1920x1080) or 4k (3840x2160). '
+                             '2k uses ~4x less GPU memory. Default: from config (4k).')
     parser.add_argument('--save_samples_every', type=int, default=10,
                         help='Save validation sample images every N epochs (0 to disable)')
 
@@ -775,16 +798,24 @@ def main():
         print(f"Trainable parameters: {trainable_params:,}")
 
     # Wrap with DDP
+    # broadcast_buffers=False: model buffers (grid_x/grid_y/bg_color) are deterministic
+    # functions of image_size and get regenerated per-rank via set_image_size().
+    # During full eval, rank 0 resizes its buffers to eval resolution while other ranks
+    # stay at training size.  With broadcast_buffers=True (default), DDP would try to
+    # broadcast rank 0's mismatched-shape buffers at the next forward pass, hanging
+    # the collective indefinitely.  Disabling this is safe because every rank already
+    # computes the same buffer values from its own input dimensions.
     if world_size > 1:
         if device.type == 'cuda':
             model = DDP(
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
+                broadcast_buffers=False,
             )
         else:
-            model = DDP(model, find_unused_parameters=False)
+            model = DDP(model, find_unused_parameters=True, broadcast_buffers=False)
 
     # Create loss function with uncertainty-based weighting
     criterion = build_loss(config.loss, config.model, flow_net=flow_net)
@@ -839,7 +870,7 @@ def main():
     )
 
     scheduler = get_scheduler(optimizer, config)
-    scaler = torch.amp.GradScaler("cuda", enabled=config.train.use_amp and device.type == 'cuda')
+    scaler = torch.cuda.amp.GradScaler(enabled=config.train.use_amp and device.type == 'cuda')
 
     # Create eval dataloader
     eval_loader = create_eval_loader(config, dataset_name='vimeo', split='test', batch_size=4)
@@ -1009,8 +1040,10 @@ def main():
 
         # Full benchmark evaluation (less frequent)
         # Includes Vimeo test and X4K cascaded 8x
-        if run_full_eval_this_epoch and is_main:
-            # Determine paths
+        # NOTE: ALL ranks enter this block so they all reach the barrier below.
+        # evaluate_full() returns {} immediately for rank != 0.
+        if run_full_eval_this_epoch:
+            # Determine paths (only rank 0 uses them, but compute is cheap)
             vimeo_test_path = args.vimeo_root or config.data.vimeo_root
             x4k_test_path = args.x4k_test_root or config.data.x4k_test_root
 
@@ -1032,8 +1065,8 @@ def main():
                 save_samples=save_samples_full,
             )
 
-            # Update best based on combined metric
-            if full_results:
+            # Update best based on combined metric (rank 0 only)
+            if is_main and full_results:
                 combined_psnr = 0.0
                 count = 0
                 if 'vimeo' in full_results:
@@ -1050,6 +1083,11 @@ def main():
                             model, optimizer, scheduler, scaler,
                             epoch, config, output_dir, is_best=True
                         )
+
+            # Sync all ranks after full eval so non-main ranks don't race ahead
+            # into the next epoch's DDP forward pass while rank 0 is still evaluating.
+            if world_size > 1:
+                dist.barrier()
 
     # Cleanup
     if writer:

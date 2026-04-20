@@ -321,6 +321,8 @@ def update_config_from_args(config: FullConfig, args) -> FullConfig:
         config.data.drop_last_mixed = args.drop_last_mixed
     if hasattr(args, 'x4k_fraction') and args.x4k_fraction is not None:
         config.data.x4k_epoch_fraction = float(args.x4k_fraction)
+    if hasattr(args, 'x4k_scale') and args.x4k_scale is not None:
+        config.data.x4k_scale = args.x4k_scale
 
     # Update X4K TEMPO-style step/n_frames configuration
     # Note: argparse converts dashes to underscores (x4k-steps -> x4k_steps)

@@ -221,9 +221,9 @@ def case_backward_step(ctx: SmokeContext) -> None:
     target = torch.rand(B, 3, S, S, device=device)
 
     if ctx.args.amp and device.type == "cuda":
-        scaler = torch.amp.GradScaler("cuda", enabled=True)
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type="cuda", enabled=True):
+        with torch.cuda.amp.autocast(enabled=True):
             out = model(frames=frames, t=0.5, timestamps=timestamps)
             loss = torch.nn.functional.l1_loss(out["pred"], target)
         scaler.scale(loss).backward()

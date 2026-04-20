@@ -4,4 +4,21 @@ outputs/*
 vfimamba*/*
 gaussian-splatting*
 VFIMamba*
-.claude*
+.claude*# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Logs and SLURM output
+gs_logs/
+gs_logs_archive/
+gs_logs_eval/
+gs_logs_old/
+slurm-*.out
+
+# Local backups
+*_old.py
+*_old.sh
+
+# Submodule / build artifacts
+diff-gaussian-rasterization/

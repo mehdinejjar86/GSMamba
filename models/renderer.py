@@ -242,7 +242,7 @@ class GaussianRenderer(nn.Module):
         # Disable autocast around the extension call to prevent half-precision
         # dispatch when AMP is active.
         if means3D.is_cuda:
-            autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=False)
+            autocast_ctx = torch.cuda.amp.autocast(enabled=False)
         else:
             autocast_ctx = nullcontext()
 
