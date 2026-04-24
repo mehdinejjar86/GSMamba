@@ -189,8 +189,7 @@ class GSMambaConfig:
     conv_stages: int = 2  # First N stages use conv, rest use Mamba
     d_state: int = 16  # SSM state dimension
 
-    # Temporal fusion
-    temporal_hidden_dim: int = 256
+    # NFrameGaussianMamba depth (was temporal_num_layers for TemporalFusion)
     temporal_num_layers: int = 4
     bidirectional: bool = True
 
@@ -225,7 +224,6 @@ class GSMambaSmallConfig(GSMambaConfig):
     """Smaller model for faster experimentation."""
     name: str = "gsmamba_small"
     embed_dims: List[int] = field(default_factory=lambda: [16, 32, 64, 128, 256])
-    temporal_hidden_dim: int = 128
     temporal_num_layers: int = 2
     refine_channels: int = 16
 
@@ -236,7 +234,6 @@ class GSMambaLargeConfig(GSMambaConfig):
     name: str = "gsmamba_large"
     embed_dims: List[int] = field(default_factory=lambda: [64, 128, 256, 512, 1024])
     depths: List[int] = field(default_factory=lambda: [2, 2, 2, 4, 4])
-    temporal_hidden_dim: int = 512
     temporal_num_layers: int = 6
     refine_channels: int = 64
 

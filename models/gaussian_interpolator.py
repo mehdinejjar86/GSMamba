@@ -14,6 +14,56 @@ import math
 from modules.temporal_ssm import TemporalSSMBlock, TemporalPositionEncoding
 
 
+def _find_bounding_frames(
+        t: Union[float, torch.Tensor],
+        timestamps: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Find the two frames that bound query timestep t.
+
+    Args:
+        t: Query timestep — scalar, (B,), (1,), or (B,1)
+        timestamps: Frame timestamps (B, N) or (N,)
+
+    Returns:
+        (idx0, idx1, alpha) — idx0/idx1: (B,) frame indices; alpha: (B,) weight in [0,1]
+    """
+    if timestamps.dim() == 1:
+        timestamps = timestamps.unsqueeze(0)
+
+    B, N = timestamps.shape
+
+    if not isinstance(t, torch.Tensor):
+        t = torch.tensor(t, device=timestamps.device, dtype=timestamps.dtype)
+    else:
+        t = t.to(device=timestamps.device, dtype=timestamps.dtype)
+
+    if t.dim() == 0:
+        t = t.expand(B)
+    elif t.dim() == 1:
+        if t.shape[0] == 1 and B > 1:
+            t = t.expand(B)
+    elif t.dim() == 2 and t.shape[1] == 1:
+        t = t.squeeze(1)
+        if t.shape[0] == 1 and B > 1:
+            t = t.expand(B)
+
+    t = t.view(B, 1)
+
+    diff = timestamps - t       # (B, N)
+    diff[diff > 0] = float('-inf')
+    idx0 = diff.argmax(dim=1)  # (B,)
+    idx1 = (idx0 + 1).clamp(max=N - 1)
+
+    t0 = timestamps.gather(1, idx0.unsqueeze(1)).squeeze(1)
+    t1 = timestamps.gather(1, idx1.unsqueeze(1)).squeeze(1)
+
+    dt = (t1 - t0).clamp(min=1e-6)
+    alpha = ((t.squeeze(1) - t0) / dt).clamp(0, 1)  # (B,)
+
+    return idx0, idx1, alpha
+
+
 class GaussianInterpolator(nn.Module):
     """
     Timestep-conditioned Gaussian interpolator.
@@ -86,64 +136,8 @@ class GaussianInterpolator(nn.Module):
             t: torch.Tensor,
             timestamps: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Find the two frames that bound the query timestep.
-
-        Args:
-            t: Query timestep (B,) or scalar
-            timestamps: Frame timestamps (B, N) or (N,)
-
-        Returns:
-            Tuple of (idx0, idx1, alpha) where alpha is interpolation weight
-        """
-        if timestamps.dim() == 1:
-            timestamps = timestamps.unsqueeze(0)
-
-        B, N = timestamps.shape
-
-        if not isinstance(t, torch.Tensor):
-            t = torch.tensor(t, device=timestamps.device, dtype=timestamps.dtype)
-        else:
-            t = t.to(device=timestamps.device, dtype=timestamps.dtype)
-
-        # Normalize t to shape (B,), supporting scalar, (1,), (B,), or (B,1)
-        if t.dim() == 0:
-            t = t.expand(B)
-        elif t.dim() == 1:
-            if t.shape[0] == 1 and B > 1:
-                t = t.expand(B)
-            elif t.shape[0] != B:
-                raise ValueError(f"t must have shape (B,) with B={B}, got {tuple(t.shape)}")
-        elif t.dim() == 2 and t.shape[1] == 1:
-            t = t.squeeze(1)
-            if t.shape[0] == 1 and B > 1:
-                t = t.expand(B)
-            elif t.shape[0] != B:
-                raise ValueError(f"t must have shape (B,1) with B={B}, got {tuple(t.shape)}")
-        else:
-            raise ValueError(f"Unsupported t shape: {tuple(t.shape)}")
-
-        t = t.view(B, 1)
-
-        # Find indices where t falls between consecutive timestamps
-        # For each t, find largest i such that timestamps[i] <= t
-        diff = timestamps - t  # (B, N)
-        diff[diff > 0] = float('-inf')  # Mask future frames
-
-        idx0 = diff.argmax(dim=1)  # (B,)
-
-        # idx1 is the next frame (or same if at end)
-        idx1 = (idx0 + 1).clamp(max=N - 1)
-
-        # Compute interpolation weight
-        t0 = timestamps.gather(1, idx0.unsqueeze(1)).squeeze(1)  # (B,)
-        t1 = timestamps.gather(1, idx1.unsqueeze(1)).squeeze(1)  # (B,)
-
-        # Avoid division by zero when t0 == t1
-        dt = (t1 - t0).clamp(min=1e-6)
-        alpha = ((t.squeeze(1) - t0) / dt).clamp(0, 1)  # (B,)
-
-        return idx0, idx1, alpha
+        """Delegates to module-level _find_bounding_frames."""
+        return _find_bounding_frames(t, timestamps)
 
     def _gather_gaussians(
             self,
@@ -493,4 +487,164 @@ class SSMGaussianInterpolator(nn.Module):
             'rotation': F.normalize(out[..., 6:10], dim=-1),  # unit quaternion
             'opacity': torch.sigmoid(out[..., 10:11]),
             'color': torch.sigmoid(out[..., 11:14]),
+        }
+
+
+def morton_encode_3d(xyz: torch.Tensor, bits: int = 10) -> torch.Tensor:
+    """
+    Compute 3D Morton (Z-order) codes for a batch of 3D points.
+
+    Normalises xyz per-batch element before quantising so absolute scale
+    and scene size don't matter.
+
+    Args:
+        xyz:  (B, N, 3) float tensor — Gaussian xyz coordinates
+        bits: bits per dimension (10 → 30-bit code, handles up to 1024³ grid)
+
+    Returns:
+        (B, N) int64 Morton codes — argsort of this gives spatial ordering
+    """
+    xyz_min = xyz.amin(dim=1, keepdim=True)            # (B, 1, 3)
+    xyz_max = xyz.amax(dim=1, keepdim=True)            # (B, 1, 3)
+    xyz_n = (xyz - xyz_min) / (xyz_max - xyz_min + 1e-6)  # (B, N, 3) in [0, 1]
+    q = (xyz_n * ((1 << bits) - 1)).long().clamp(0, (1 << bits) - 1)  # quantise
+
+    def spread(v: torch.Tensor) -> torch.Tensor:
+        """Interleave bits with two zeros between each bit (10-bit input → 30-bit)."""
+        v = v & 0x3ff
+        v = (v | (v << 16)) & 0x030000ff
+        v = (v | (v <<  8)) & 0x0300f00f
+        v = (v | (v <<  4)) & 0x030c30c3
+        v = (v | (v <<  2)) & 0x09249249
+        return v
+
+    x, y, z = q[..., 0], q[..., 1], q[..., 2]
+    return spread(x) | (spread(y) << 1) | (spread(z) << 2)  # (B, N) int64
+
+
+class NFrameGaussianMamba(nn.Module):
+    """
+    Mamba SSM over the merged N-frame Gaussian cloud.
+
+    Replaces both TemporalFusion and GaussianInterpolator with a single module
+    that operates directly in Gaussian parameter space.
+
+    Memory pattern:
+        Old TemporalFusion:   (B·H·W, N, C_feat) — huge batch, tiny seq → OOM
+        NFrameGaussianMamba:  (B, N·H·W, 14)     — small batch, long seq → O(D·N) CUDA
+
+    At 768×768, N=2, B=2:
+        Old deltaA: (1.18M, 2, 256, 16) ≈ 36 GB  → OOM
+        New state:  (2, 28, 16)          ≈ negligible
+
+    Args:
+        d_state: SSM state dimension (default: 16)
+        expand: Inner dimension multiplier (default: 2, → d_inner = 28)
+        num_layers: Number of TemporalSSMBlock layers (default: 2)
+    """
+
+    GAUSSIAN_DIM = 14  # xyz(3) + scale(3) + rotation(4) + opacity(1) + color(3)
+
+    def __init__(self, d_state: int = 16, expand: int = 2, num_layers: int = 2):
+        super().__init__()
+        D = self.GAUSSIAN_DIM
+        self.pos_encoding = TemporalPositionEncoding(D, max_len=100)
+        self.layers = nn.ModuleList([
+            TemporalSSMBlock(d_model=D, d_state=d_state, expand=expand, bidirectional=True)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(D)
+
+    @staticmethod
+    def _pack(gaussians_list: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
+        """Pack N Gaussian dicts into (B, N·HW, 14)."""
+        return torch.cat([
+            torch.cat([g['xyz'], g['scale'], g['rotation'], g['opacity'], g['color']], dim=-1)
+            for g in gaussians_list
+        ], dim=1)
+
+    def forward(
+            self,
+            gaussians_list: List[Dict[str, torch.Tensor]],
+            t: Union[float, torch.Tensor],
+            timestamps: Optional[torch.Tensor] = None,
+            flow: Optional[torch.Tensor] = None,  # accepted for API compat, not used
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Refine N Gaussian clouds with Mamba and interpolate to timestep t.
+
+        Args:
+            gaussians_list: N dicts, each with (B, HW, C) tensors
+                            keys: xyz, scale, rotation, opacity, color
+            t: Query timestep in [0, 1]
+            timestamps: Frame timestamps (B, N) or (N,). None → uniform.
+            flow: Unused (kept for drop-in compatibility with GaussianInterpolator).
+
+        Returns:
+            Gaussian dict at timestep t, shapes (B, HW, C).
+        """
+        B = gaussians_list[0]['xyz'].shape[0]
+        N = len(gaussians_list)
+        HW = gaussians_list[0]['xyz'].shape[1]
+        device = gaussians_list[0]['xyz'].device
+
+        if timestamps is None:
+            timestamps = torch.linspace(0, 1, N, device=device).unsqueeze(0).expand(B, -1)
+        elif timestamps.dim() == 1:
+            timestamps = timestamps.unsqueeze(0).expand(B, -1)
+        elif timestamps.dim() == 2 and timestamps.shape[0] == 1 and B > 1:
+            timestamps = timestamps.expand(B, -1)
+
+        # Pack each frame sorted by 3D Morton code so spatially proximate Gaussians
+        # from different frames become adjacent in the Mamba sequence.
+        sorted_frames = []
+        for n in range(N):
+            params_n = torch.cat([
+                gaussians_list[n]['xyz'],
+                gaussians_list[n]['scale'],
+                gaussians_list[n]['rotation'],
+                gaussians_list[n]['opacity'],
+                gaussians_list[n]['color'],
+            ], dim=-1)                                              # (B, HW, 14)
+            codes = morton_encode_3d(params_n[..., :3])            # (B, HW) — xyz only
+            perm  = codes.argsort(dim=1)                           # (B, HW)
+            sorted_frames.append(
+                params_n.gather(1, perm.unsqueeze(-1).expand_as(params_n))
+            )
+        all_params = torch.cat(sorted_frames, dim=1)               # (B, N·HW, 14)
+
+        # Temporal position encoding — each HW block shares its frame's timestamp
+        ts_per_pos = timestamps.unsqueeze(-1).expand(B, N, HW).reshape(B, N * HW)
+        all_params = self.pos_encoding(all_params, ts_per_pos)
+
+        # Mamba refinement: (B, N·HW, 14) — CUDA kernel, O(D·N) state
+        for layer in self.layers:
+            all_params = layer(all_params)
+        all_params = self.norm(all_params)
+
+        # Find the two bounding frames for time t
+        idx0, idx1, alpha = _find_bounding_frames(t, timestamps)
+
+        # Extract bounding-frame Gaussian params: (B, HW, 14)
+        g0 = torch.stack([all_params[b, idx0[b] * HW:(idx0[b] + 1) * HW] for b in range(B)])
+        g1 = torch.stack([all_params[b, idx1[b] * HW:(idx1[b] + 1) * HW] for b in range(B)])
+
+        a = alpha.view(B, 1, 1)  # broadcast over (HW, C)
+
+        # Interpolate with per-parameter activations
+        xyz_t   = (1 - a) * g0[..., :3]   + a * g1[..., :3]
+        scale_t = F.softplus((1 - a) * g0[..., 3:6]  + a * g1[..., 3:6])
+        rot_t   = GaussianInterpolator._slerp(
+                      F.normalize(g0[..., 6:10], dim=-1),
+                      F.normalize(g1[..., 6:10], dim=-1),
+                      a)
+        opac_t  = torch.sigmoid((1 - a) * g0[..., 10:11] + a * g1[..., 10:11])
+        color_t = torch.sigmoid((1 - a) * g0[..., 11:14] + a * g1[..., 11:14])
+
+        return {
+            'xyz': xyz_t,
+            'scale': scale_t,
+            'rotation': rot_t,
+            'opacity': opac_t,
+            'color': color_t,
         }

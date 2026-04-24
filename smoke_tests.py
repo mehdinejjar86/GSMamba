@@ -35,7 +35,7 @@ from config import GSMambaSmallConfig
 from data.utils import create_eval_loader
 from data.vimeo import VimeoTriplet, vimeo_collate
 from data.x4k import X4K1000Dataset
-from models.gaussian_interpolator import GaussianInterpolator
+from models.gaussian_interpolator import GaussianInterpolator, NFrameGaussianMamba
 from models.gs_mamba import GSMamba
 from models.renderer import GaussianRenderer, RASTERIZER_AVAILABLE
 from models.temporal_fusion import HybridTemporalFusion
@@ -68,7 +68,6 @@ def _make_tiny_model(device: torch.device, image_size: int) -> GSMamba:
     cfg.depths = [1, 1, 1, 1, 1]
     cfg.embed_dims = [16, 24, 32, 48, 64]
     cfg.temporal_num_layers = 1
-    cfg.temporal_hidden_dim = 64
     cfg.refine_channels = 8
     cfg.use_refinement = True
 
@@ -95,32 +94,42 @@ def case_env(ctx: SmokeContext) -> None:
 
 
 def case_interpolator_shapes(ctx: SmokeContext) -> None:
-    _banner("Gaussian Interpolator Shapes")
-    B, N, P = 2, 4, 16
+    _banner("NFrameGaussianMamba Shapes")
+    from models.gaussian_interpolator import NFrameGaussianMamba
+    B, N, HW = 2, 3, 8 * 8
     device = ctx.device
 
-    gaussians: List[Dict[str, torch.Tensor]] = []
-    for _ in range(N):
-        gaussians.append({
-            "xyz": torch.randn(B, P, 3, device=device),
-            "scale": torch.rand(B, P, 3, device=device) * 0.1 + 1e-3,
-            "rotation": F.normalize(torch.randn(B, P, 4, device=device), dim=-1),
-            "opacity": torch.sigmoid(torch.randn(B, P, 1, device=device)),
-            "color": torch.sigmoid(torch.randn(B, P, 3, device=device)),
-        })
+    gaussians_list = [
+        {
+            "xyz":      torch.randn(B, HW, 3, device=device),
+            "scale":    torch.rand(B, HW, 3, device=device).add(0.01),
+            "rotation": F.normalize(torch.randn(B, HW, 4, device=device), dim=-1),
+            "opacity":  torch.sigmoid(torch.randn(B, HW, 1, device=device)),
+            "color":    torch.sigmoid(torch.randn(B, HW, 3, device=device)),
+        }
+        for _ in range(N)
+    ]
+    timestamps = torch.linspace(0, 1, N, device=device).unsqueeze(0).expand(B, -1)
 
-    interp = GaussianInterpolator(hidden_dim=32, num_layers=1).to(device).eval()
+    model = NFrameGaussianMamba(d_state=8, expand=2, num_layers=2).to(device).eval()
 
-    out1 = interp(gaussians, t=0.5)
-    out2 = interp(gaussians, t=torch.tensor([0.25, 0.75], device=device), timestamps=torch.tensor([0.0, 0.3, 0.7, 1.0], device=device))
-    out3 = interp(gaussians, t=torch.tensor([[0.25], [0.75]], device=device), timestamps=torch.tensor([[0.0, 0.4, 0.8, 1.0], [0.0, 0.2, 0.5, 1.0]], device=device))
+    # scalar t
+    out1 = model(gaussians_list, t=0.5, timestamps=timestamps)
+    # batched t
+    out2 = model(gaussians_list, t=torch.tensor([0.25, 0.75], device=device), timestamps=timestamps)
 
-    for name, out in [("out1", out1), ("out2", out2), ("out3", out3)]:
-        if tuple(out["xyz"].shape) != (B, P, 3):
+    for name, out in [("out1", out1), ("out2", out2)]:
+        if tuple(out["xyz"].shape) != (B, HW, 3):
             raise AssertionError(f"{name}.xyz shape mismatch: {tuple(out['xyz'].shape)}")
+        if tuple(out["rotation"].shape) != (B, HW, 4):
+            raise AssertionError(f"{name}.rotation shape mismatch: {tuple(out['rotation'].shape)}")
+        norms = out["rotation"].norm(dim=-1)
+        if not torch.allclose(norms, torch.ones_like(norms), atol=1e-5):
+            raise AssertionError(f"{name}.rotation not unit quaternions")
         _assert_finite(f"{name}.xyz", out["xyz"])
+        _assert_finite(f"{name}.opacity", out["opacity"])
 
-    print("interpolator outputs are shape-consistent for scalar and batched t")
+    print(f"NFrameGaussianMamba outputs correct shapes and unit quaternions for B={B}, N={N}, HW={HW}")
 
 
 def case_hybrid_temporal_fusion(ctx: SmokeContext) -> None:

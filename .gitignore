@@ -15,6 +15,7 @@ gs_logs_archive/
 gs_logs_eval/
 gs_logs_old/
 slurm-*.out
+logs/*
 
 # Local backups
 *_old.py

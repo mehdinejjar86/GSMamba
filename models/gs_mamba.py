@@ -17,9 +17,8 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from config import GSMambaConfig
 from models.feature_encoder import FeatureEncoder
-from models.temporal_fusion import MultiScaleTemporalFusion, TemporalFusion
 from models.gaussian_head import GaussianHead, GaussianAssembler, MultiScaleGaussianHead
-from models.gaussian_interpolator import GaussianInterpolator
+from models.gaussian_interpolator import GaussianInterpolator, NFrameGaussianMamba
 from models.renderer import GaussianRenderer
 from models.refine import UNetRefine
 
@@ -70,17 +69,7 @@ class GSMamba(nn.Module):
             d_state=config.d_state,
         )
 
-        # 2. Temporal Fusion (at each scale)
-        self.temporal_fusion = MultiScaleTemporalFusion(
-            dims=config.embed_dims,
-            num_layers=config.temporal_num_layers,
-            d_state=config.d_state,
-            bidirectional=True,
-            # Only fuse at Mamba stages (skip conv stages)
-            scales_to_fuse=list(range(config.conv_stages, len(config.embed_dims))),
-        )
-
-        # 3. Gaussian Prediction Head
+        # 3. Gaussian Prediction Head  (TemporalFusion removed — see NFrameGaussianMamba)
         self.gaussian_head = MultiScaleGaussianHead(
             in_channels_list=config.embed_dims,
             out_resolution=config.image_size,
@@ -92,11 +81,13 @@ class GSMamba(nn.Module):
             image_size=config.image_size,
         )
 
-        # 5. Gaussian Interpolator
-        self.interpolator = GaussianInterpolator(
-            hidden_dim=config.temporal_hidden_dim,
-            num_layers=2,
-            use_residual=True,
+        # 5. NFrameGaussianMamba: Mamba over merged Gaussian cloud (B, N·HW, 14)
+        #    Replaces TemporalFusion + GaussianInterpolator.
+        #    O(D·N) CUDA state — no OOM at high resolution.
+        self.gaussian_mamba = NFrameGaussianMamba(
+            d_state=config.d_state,
+            expand=2,
+            num_layers=config.temporal_num_layers,
         )
 
         # 6. Differentiable Gaussian Renderer
@@ -172,8 +163,9 @@ class GSMamba(nn.Module):
             )  # (B, N, C_s, H_s, W_s)
             multi_scale_features.append(scale_features)
 
-        # Temporal fusion at each scale
-        fused_features = self.temporal_fusion(multi_scale_features, timestamps)
+        # No feature-level temporal fusion — cross-frame context is handled
+        # by NFrameGaussianMamba in Gaussian parameter space (cheaper, no OOM).
+        fused_features = multi_scale_features
 
         # Predict Gaussians for each frame
         gaussians_list = []
@@ -210,8 +202,8 @@ class GSMamba(nn.Module):
         Returns:
             Dict with rendered image and depth
         """
-        # Interpolate Gaussians (with optional flow-guided warp)
-        gaussians_t = self.interpolator(gaussians_list, t, timestamps, flow=flow)
+        # Refine all N Gaussian clouds with Mamba, then interpolate to t
+        gaussians_t = self.gaussian_mamba(gaussians_list, t, timestamps, flow=flow)
 
         # Render
         render_output = self.renderer(gaussians_t)

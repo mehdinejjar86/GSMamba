@@ -154,10 +154,13 @@ class TemporalSSMBlock(nn.Module):
         """
         Selective scan implementation.
 
+        Uses the mamba_ssm CUDA kernel when available (O(D·N) state, no large
+        intermediates), falling back to a Python reference loop on CPU.
+
         Args:
             u: Input (B, L, D)
-            delta: Time step (B, L, D)
-            A: State matrix (D, N)
+            delta: Time step (B, L, D)  — already softplus'd by caller
+            A: State matrix (D, N)      — already negated: -exp(A_log)
             B: Input modulation (B, L, N)
             C: Output modulation (B, L, N)
             D: Skip connection (D,)
@@ -165,14 +168,32 @@ class TemporalSSMBlock(nn.Module):
         Returns:
             Output (B, L, D)
         """
+        if selective_scan_fn is not None and u.is_cuda:
+            # CUDA kernel path: O(D·N) state, no L-sized deltaA allocation.
+            # selective_scan_fn expects (B, D, L) layout and handles the D
+            # skip connection internally.
+            y = selective_scan_fn(
+                u.transpose(1, 2).contiguous(),      # (B, D, L)
+                delta.transpose(1, 2).contiguous(),   # (B, D, L)
+                A,                                    # (D, N)
+                B.transpose(1, 2).contiguous(),       # (B, N, L)
+                C.transpose(1, 2).contiguous(),       # (B, N, L)
+                D,                                    # (D,)
+                z=None,
+                delta_bias=None,
+                delta_softplus=False,  # already applied by caller
+                return_last_state=False,
+            ).transpose(1, 2)  # → (B, L, D)
+            return y
+
+        # CPU / fallback reference: O(B·L·D·N) memory + Python loop.
+        # Only used for unit-testing on CPU; avoid for large sequences.
         B_batch, L, D_dim = u.shape
         N = A.shape[1]
 
-        # Discretize
         deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, D, N)
         deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, D, N)
 
-        # Scan
         x = torch.zeros(B_batch, D_dim, N, device=u.device, dtype=u.dtype)
         ys = []
 
@@ -182,10 +203,7 @@ class TemporalSSMBlock(nn.Module):
             ys.append(y)
 
         y = torch.stack(ys, dim=1)  # (B, L, D)
-
-        # Skip connection
-        y = y + u * D.unsqueeze(0).unsqueeze(0)
-
+        y = y + u * D.unsqueeze(0).unsqueeze(0)  # skip connection
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
