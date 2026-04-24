@@ -258,7 +258,7 @@ def train_one_epoch(
         optimizer.zero_grad()
 
         use_amp = config.train.use_amp and device.type == 'cuda'
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             # Model forward
             output = model(
                 frames=frames,
@@ -870,7 +870,7 @@ def main():
     )
 
     scheduler = get_scheduler(optimizer, config)
-    scaler = torch.cuda.amp.GradScaler(enabled=config.train.use_amp and device.type == 'cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=config.train.use_amp and device.type == 'cuda')
 
     # Create eval dataloader
     eval_loader = create_eval_loader(config, dataset_name='vimeo', split='test', batch_size=4)

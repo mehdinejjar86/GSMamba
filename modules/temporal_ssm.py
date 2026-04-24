@@ -172,13 +172,16 @@ class TemporalSSMBlock(nn.Module):
             # CUDA kernel path: O(D·N) state, no L-sized deltaA allocation.
             # selective_scan_fn expects (B, D, L) layout and handles the D
             # skip connection internally.
+            # Cast delta/B/C to u.dtype — F.softplus can upcast to float32
+            # under AMP, causing a dtype mismatch with float16 u.
+            dtype = u.dtype
             y = selective_scan_fn(
-                u.transpose(1, 2).contiguous(),      # (B, D, L)
-                delta.transpose(1, 2).contiguous(),   # (B, D, L)
-                A,                                    # (D, N)
-                B.transpose(1, 2).contiguous(),       # (B, N, L)
-                C.transpose(1, 2).contiguous(),       # (B, N, L)
-                D,                                    # (D,)
+                u.transpose(1, 2).contiguous(),               # (B, D, L)
+                delta.to(dtype).transpose(1, 2).contiguous(), # (B, D, L)
+                A,                                            # (D, N) float32 OK
+                B.to(dtype).transpose(1, 2).contiguous(),    # (B, N, L)
+                C.to(dtype).transpose(1, 2).contiguous(),    # (B, N, L)
+                D,                                            # (D,) float32 OK
                 z=None,
                 delta_bias=None,
                 delta_softplus=False,  # already applied by caller
