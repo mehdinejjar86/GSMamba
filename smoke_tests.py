@@ -61,7 +61,7 @@ def _count_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def _make_tiny_model(device: torch.device, image_size: int) -> GSMamba:
+def _make_tiny_model(device: torch.device, image_size: int, motion: bool = False) -> GSMamba:
     cfg = GSMambaSmallConfig()
     cfg.image_size = (image_size, image_size)
     cfg.depths = [1, 1, 1, 1, 1]
@@ -69,6 +69,14 @@ def _make_tiny_model(device: torch.device, image_size: int) -> GSMamba:
     cfg.temporal_num_layers = 1
     cfg.refine_channels = 8
     cfg.use_refinement = True
+
+    if motion:
+        # Exercise the Phase 3/4 motion branch: latent-augmented 3D mixing + Mamba
+        # motion head + forward-warp merge + real coverage map into refine.
+        cfg.predict_motion = True
+        cfg.gaussian_feat_dim = 16
+        cfg.motion_accel = True
+        cfg.refine_real_coverage = True
 
     model = GSMamba(cfg).to(device)
     return model
@@ -226,6 +234,63 @@ def case_backward_step(ctx: SmokeContext) -> None:
     if not torch.isfinite(loss.detach()):
         raise AssertionError(f"loss is non-finite: {loss_value}")
     print(f"train step loss={loss_value:.6f}")
+
+
+def case_motion_forward_backward(ctx: SmokeContext) -> None:
+    _banner("Motion Path (predict_motion) Forward + Backward")
+    device = ctx.device
+    B, N, S = 1, max(3, ctx.args.frames), ctx.args.size
+
+    model = _make_tiny_model(device, S, motion=True).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    frames = torch.rand(B, N, 3, S, S, device=device)
+    # Deliberately NON-uniform frame spacing (must be handled via each token's timestamp).
+    ts = torch.linspace(0.0, 1.0, N, device=device).clone()
+    if N >= 3:
+        ts[1] = ts[1] * 0.5
+    timestamps = ts.unsqueeze(0).expand(B, -1).contiguous()
+    target = torch.rand(B, 3, S, S, device=device)
+
+    optimizer.zero_grad(set_to_none=True)
+    out = model(frames=frames, t=0.4, timestamps=timestamps, return_intermediates=True)
+    pred = out["pred"]
+
+    if tuple(pred.shape) != (B, 3, S, S):
+        raise AssertionError(f"pred shape mismatch: {tuple(pred.shape)}")
+    _assert_finite("motion_pred", pred)
+
+    # Motion synthesis forward-warps + merges all N frames -> N*HW gaussians
+    # (the default 2-frame blend would return HW), so this confirms the motion path ran.
+    HW = S * S
+    g_xyz = out["gaussians"]["xyz"]
+    if tuple(g_xyz.shape) != (B, N * HW, 3):
+        raise AssertionError(
+            f"expected merged motion cloud {(B, N * HW, 3)}, got {tuple(g_xyz.shape)}"
+        )
+    rnorm = out["gaussians"]["rotation"].norm(dim=-1)
+    if not torch.allclose(rnorm, torch.ones_like(rnorm), atol=1e-4):
+        raise AssertionError("motion-path rotations are not unit quaternions")
+
+    loss = torch.nn.functional.l1_loss(pred, target)
+    loss.backward()
+    if not torch.isfinite(loss.detach()):
+        raise AssertionError(f"non-finite motion loss: {float(loss.detach())}")
+
+    # Motion is reasoned post-mixing: the Mamba-side motion head must exist, and on a
+    # differentiable (CUDA) rasterizer it must receive a finite gradient.
+    mh = model.gaussian_mamba.motion_head
+    if mh is None:
+        raise AssertionError("motion head missing despite predict_motion=True")
+    got_grad = mh.weight.grad is not None
+    if got_grad and not torch.isfinite(mh.weight.grad).all():
+        raise AssertionError("motion-head gradient is non-finite")
+    if device.type == "cuda" and RASTERIZER_AVAILABLE and not got_grad:
+        raise AssertionError("motion head received no gradient on the CUDA rasterizer path")
+    optimizer.step()
+
+    print(f"motion path OK: merged={tuple(g_xyz.shape)} (N*HW), loss={float(loss.detach()):.6f}, "
+          f"motion-head grad={'yes' if got_grad else 'no (cpu fallback)'}")
 
 
 def case_train_help(_: SmokeContext) -> None:
@@ -559,6 +624,7 @@ def main() -> int:
         ("renderer_forward", case_renderer),
         ("model_forward", case_model_forward),
         ("single_optimizer_step", case_backward_step),
+        ("motion_forward_backward", case_motion_forward_backward),
         ("train_help", case_train_help),
         ("validation_synthetic_loop", case_validation_synthetic),
         ("slerp_correctness", case_slerp_correctness),
