@@ -50,14 +50,10 @@ class GaussianHead(nn.Module):
 
     OUT_CHANNELS = 14
 
-    # Optional per-Gaussian 3D motion, appended when predict_motion=True:
-    #   velocity (14:17), angular velocity (17:20), acceleration (20:23) if motion_accel.
-    VELOCITY_START = 14
-    VELOCITY_END = 17
-    ANGVEL_START = 17
-    ANGVEL_END = 20
-    ACCEL_START = 20
-    ACCEL_END = 23
+    # Optional per-Gaussian latent feature (Phase 4), appended after the 14 params when
+    # predict_motion=True. Consumed by the Gaussian-space Mamba for cross-frame reasoning;
+    # motion is then read off the mixed tokens (a Mamba-side head), not here.
+    FEAT_START = 14
 
     def __init__(
             self,
@@ -67,16 +63,15 @@ class GaussianHead(nn.Module):
             init_scale: float = 0.01,
             init_opacity: float = -2.0,
             predict_motion: bool = False,
-            motion_accel: bool = False,
+            gaussian_feat_dim: int = 0,
     ):
         super().__init__()
 
         hidden_channels = hidden_channels or in_channels
         self.predict_motion = predict_motion
-        self.motion_accel = predict_motion and motion_accel
-        # motion channels: velocity(3) + angular velocity(3) [+ acceleration(3)]
-        motion_ch = (6 + (3 if self.motion_accel else 0)) if predict_motion else 0
-        out_channels = self.OUT_CHANNELS + motion_ch
+        # Per-Gaussian latent feature width (Phase 4); 0 disables (motion lives in the Mamba).
+        self.feat_dim = gaussian_feat_dim if predict_motion else 0
+        out_channels = self.OUT_CHANNELS + self.feat_dim
 
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, 3, 1, 1)
         self.act = nn.GELU()
@@ -152,14 +147,9 @@ class GaussianHead(nn.Module):
             'opacity': opacity,
         }
 
-        if self.predict_motion:
-            # Per-Gaussian motion (bias-init 0 -> starts motion-free, learned from
-            # photometric + gflow). velocity & angular velocity advect/rotate Gaussians
-            # to t; optional acceleration gives a quadratic path.
-            params['velocity'] = out[:, self.VELOCITY_START:self.VELOCITY_END]
-            params['angular_velocity'] = out[:, self.ANGVEL_START:self.ANGVEL_END]
-            if self.motion_accel:
-                params['acceleration'] = out[:, self.ACCEL_START:self.ACCEL_END]
+        if self.feat_dim > 0:
+            # Per-Gaussian latent feature for cross-frame 3D reasoning (Phase 4).
+            params['feat'] = out[:, self.FEAT_START:self.FEAT_START + self.feat_dim]
 
         return params
 
@@ -183,28 +173,40 @@ class MultiScaleGaussianHead(nn.Module):
             out_resolution: Tuple[int, int] = (256, 256),
             fusion_channels: int = 64,
             predict_motion: bool = False,
-            motion_accel: bool = False,
+            gaussian_feat_dim: int = 0,
+            proj_cap: int = 128,
     ):
         super().__init__()
 
         self.num_scales = len(in_channels_list)
         self.out_resolution = out_resolution
 
-        # Per-scale projection
+        # Per-scale projection + fusion width.
+        # Default: uniform `fusion_channels` (unchanged, checkpoint-safe).
+        # Phase 4 (predict_motion): "unthrottle" — keep more of the deep scales
+        # (project each to min(c, proj_cap)) and widen the fusion, so the encoder's
+        # 512-d depth actually reaches the Gaussians instead of being crushed to 64.
+        if predict_motion:
+            proj_dims = [min(c, proj_cap) for c in in_channels_list]
+            fusion_width = max(fusion_channels, proj_cap)
+        else:
+            proj_dims = [fusion_channels] * self.num_scales
+            fusion_width = fusion_channels
+
         self.scale_projs = nn.ModuleList([
-            nn.Conv2d(c, fusion_channels, 1) for c in in_channels_list
+            nn.Conv2d(c, p, 1) for c, p in zip(in_channels_list, proj_dims)
         ])
 
         # Fusion and final prediction
         self.fusion = nn.Sequential(
-            nn.Conv2d(fusion_channels * self.num_scales, fusion_channels, 3, 1, 1),
+            nn.Conv2d(sum(proj_dims), fusion_width, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(fusion_channels, fusion_channels, 3, 1, 1),
+            nn.Conv2d(fusion_width, fusion_width, 3, 1, 1),
             nn.GELU(),
         )
 
-        self.head = GaussianHead(fusion_channels, predict_motion=predict_motion,
-                                 motion_accel=motion_accel)
+        self.head = GaussianHead(fusion_width, predict_motion=predict_motion,
+                                 gaussian_feat_dim=gaussian_feat_dim)
 
     def forward(self, multi_scale_features: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -357,9 +359,9 @@ class GaussianAssembler(nn.Module):
             'color': color,
         }
 
-        # Optional per-Gaussian motion fields (motion synthesis). Same (B, N, 3) layout.
-        for _mk in ('velocity', 'angular_velocity', 'acceleration'):
-            if _mk in gaussian_params:
-                out[_mk] = gaussian_params[_mk].view(B, 3, -1).permute(0, 2, 1)
+        # Optional per-Gaussian latent feature (Phase 4): (B, C, H, W) -> (B, HW, C).
+        if 'feat' in gaussian_params:
+            feat = gaussian_params['feat']
+            out['feat'] = feat.view(B, feat.shape[1], -1).permute(0, 2, 1)
 
         return out

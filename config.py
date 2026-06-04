@@ -210,8 +210,9 @@ class GSMambaConfig:
     # Handles object translation, rotation and disocclusion. Bootstrapped by gflow +
     # render supervision. Default False -> exact pre-Phase-3 synthesis (checkpoint-safe).
     predict_motion: bool = False
-    motion_accel: bool = False   # also predict per-Gaussian acceleration (quadratic path)
-    motion_frames_k: int = 0     # frames to advect+merge at t: 0 = all N, else K nearest
+    motion_accel: bool = False     # also predict per-Gaussian acceleration (quadratic path)
+    motion_frames_k: int = 0       # frames to advect+merge at t: 0 = all N, else K nearest
+    gaussian_feat_dim: int = 32    # per-Gaussian latent width mixed in 3D (Phase 4); used only when predict_motion
 
     # Renderer
     sh_degree: int = 0  # Start simple, can increase

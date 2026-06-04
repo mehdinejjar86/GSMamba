@@ -150,16 +150,29 @@ class NFrameGaussianMamba(nn.Module):
     GAUSSIAN_DIM = 14  # xyz(3) + scale(3) + rotation(4) + opacity(1) + color(3)
 
     def __init__(self, d_state: int = 16, expand: int = 2, num_layers: int = 2,
-                 motion_frames_k: int = 0):
+                 motion_frames_k: int = 0, feat_dim: int = 0, motion_accel: bool = False):
         super().__init__()
         self.motion_frames_k = motion_frames_k
-        D = self.GAUSSIAN_DIM
+        self.feat_dim = feat_dim                       # per-Gaussian latent width (Phase 4); 0 = off
+        self.motion_accel = motion_accel
+        D = self.GAUSSIAN_DIM + feat_dim               # token = params(14) [+ latent(F)]
+        self.D = D
         self.pos_encoding = TemporalPositionEncoding(D, max_len=100)
         self.layers = nn.ModuleList([
             TemporalSSMBlock(d_model=D, d_state=d_state, expand=expand, bidirectional=True)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(D)
+
+        # Motion head (Phase 4): reads the cross-frame-mixed token -> per-Gaussian motion
+        # = velocity(3) + angular velocity(3) [+ acceleration(3)]. Zero-init so synthesis
+        # starts motion-free. Only built when latent mixing is on (feat_dim > 0).
+        self.motion_head = None
+        if feat_dim > 0:
+            motion_out = 6 + (3 if motion_accel else 0)
+            self.motion_head = nn.Linear(D, motion_out)
+            nn.init.zeros_(self.motion_head.weight)
+            nn.init.zeros_(self.motion_head.bias)
 
     @staticmethod
     def _slerp(q0: torch.Tensor, q1: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
@@ -226,7 +239,12 @@ class NFrameGaussianMamba(nn.Module):
         elif timestamps.dim() == 2 and timestamps.shape[0] == 1 and B > 1:
             timestamps = timestamps.expand(B, -1)
 
-        has_velocity = 'velocity' in gaussians_list[0]
+        use_motion = self.feat_dim > 0   # Phase 4: latent-augmented mixing + Mamba motion head
+
+        # Per-Gaussian token = 14 params [+ F latent when motion is on].
+        pack_keys = ['xyz', 'scale', 'rotation', 'opacity', 'color']
+        if use_motion:
+            pack_keys.append('feat')
 
         # Pack each frame sorted by 3D Morton code so spatially proximate Gaussians
         # from different frames become adjacent in the Mamba sequence.  Keep the
@@ -234,20 +252,14 @@ class NFrameGaussianMamba(nn.Module):
         sorted_frames = []
         perms = []
         for n in range(N):
-            params_n = torch.cat([
-                gaussians_list[n]['xyz'],
-                gaussians_list[n]['scale'],
-                gaussians_list[n]['rotation'],
-                gaussians_list[n]['opacity'],
-                gaussians_list[n]['color'],
-            ], dim=-1)                                              # (B, HW, 14)
+            params_n = torch.cat([gaussians_list[n][k] for k in pack_keys], dim=-1)  # (B, HW, D)
             codes = morton_encode_3d(params_n[..., :3])            # (B, HW) — xyz only
             perm  = codes.argsort(dim=1)                           # (B, HW)
             perms.append(perm)
             sorted_frames.append(
                 params_n.gather(1, perm.unsqueeze(-1).expand_as(params_n))
             )
-        all_params = torch.cat(sorted_frames, dim=1)               # (B, N·HW, 14)
+        all_params = torch.cat(sorted_frames, dim=1)               # (B, N·HW, D)
 
         # Temporal position encoding — each HW block shares its frame's timestamp
         ts_per_pos = timestamps.unsqueeze(-1).expand(B, N, HW).reshape(B, N * HW)
@@ -262,7 +274,7 @@ class NFrameGaussianMamba(nn.Module):
         idx0, idx1, alpha = _find_bounding_frames(t, timestamps)
         a = alpha.view(B, 1, 1)  # broadcast over (HW, C)
 
-        if not has_velocity:
+        if not use_motion:
             # ---- Default synthesis: blend the two Morton-sorted bounding blocks ----
             g0 = torch.stack([all_params[b, idx0[b] * HW:(idx0[b] + 1) * HW] for b in range(B)])
             g1 = torch.stack([all_params[b, idx1[b] * HW:(idx1[b] + 1) * HW] for b in range(B)])
@@ -284,24 +296,23 @@ class NFrameGaussianMamba(nn.Module):
                 'color': color_t,
             }
 
-        # ---- Motion synthesis (predict_motion): forward-warp + merge ----
-        # Unsort each frame's refined block back to pixel order so it aligns with the
-        # per-pixel motion fields (which bypass the Mamba), advect+rotate every (or the K
-        # nearest) frame's Gaussians to time t, and merge the warped clouds weighted by
-        # temporal proximity.  Correspondence-free: each frame moves its own Gaussians;
-        # the rasterizer composites by depth (handles motion, rotation, disocclusion).
+        # ---- Motion synthesis (Phase 4): mixed-token motion head + forward-warp + merge ----
+        # Unsort each frame's cross-frame-mixed token back to pixel order, read per-Gaussian
+        # motion from the mixed token (the motion head), advect+rotate every (or the K nearest)
+        # frame's Gaussians to time t, and merge the warped clouds weighted by temporal
+        # proximity.  The rasterizer composites by depth (motion, rotation, disocclusion).
         refined = []
         for n in range(N):
-            block_n = all_params[:, n * HW:(n + 1) * HW, :]        # (B, HW, 14) sorted
+            block_n = all_params[:, n * HW:(n + 1) * HW, :]        # (B, HW, D) sorted
             inv = perms[n].argsort(dim=1)                          # inverse perm -> pixel order
             refined.append(block_n.gather(1, inv.unsqueeze(-1).expand_as(block_n)))
-        refined = torch.stack(refined, dim=0)                      # (N, B, HW, 14) pixel order
+        refined = torch.stack(refined, dim=0)                      # (N, B, HW, D) pixel order
 
-        vel = torch.stack([g['velocity'] for g in gaussians_list], dim=0)  # (N, B, HW, 3)
-        ang = (torch.stack([g['angular_velocity'] for g in gaussians_list], dim=0)
-               if 'angular_velocity' in gaussians_list[0] else None)
-        acc = (torch.stack([g['acceleration'] for g in gaussians_list], dim=0)
-               if 'acceleration' in gaussians_list[0] else None)
+        # Per-Gaussian motion read from the cross-frame-mixed tokens.
+        motion = self.motion_head(refined)                         # (N, B, HW, 6 or 9)
+        vel = motion[..., 0:3]
+        ang = motion[..., 3:6]
+        acc = motion[..., 6:9] if self.motion_accel else None
 
         # Per-frame time delta to the (unclamped) query time t:  Δ_n = t - t_n
         if not torch.is_tensor(t):
@@ -321,10 +332,10 @@ class NFrameGaussianMamba(nn.Module):
         nf = sel.shape[1]
         bo = torch.arange(B, device=device).view(B, 1)            # (B, 1), broadcasts with sel
 
-        g_sel = refined[sel, bo]                                   # (B, nf, HW, 14)
+        g_sel = refined[sel, bo]                                   # (B, nf, HW, D)  (use [:14])
         v_sel = vel[sel, bo]                                       # (B, nf, HW, 3)
+        w_sel = ang[sel, bo]                                       # (B, nf, HW, 3)
         a_sel = acc[sel, bo] if acc is not None else None
-        w_sel = ang[sel, bo] if ang is not None else None
         d_sel = delta.gather(1, sel)                              # (B, nf)
 
         # Temporal-proximity opacity weights over the selected frames.
@@ -337,11 +348,9 @@ class NFrameGaussianMamba(nn.Module):
             xyz = xyz + 0.5 * a_sel * (d * d)
 
         # Rotate orientations to t: q(t) = exp(ω_n·Δ) ⊗ q_n
-        q_src = F.normalize(g_sel[..., 6:10], dim=-1)            # (B, nf, HW, 4)
-        if w_sel is not None:
-            q_t = F.normalize(quat_mul(so3_exp_to_quat(w_sel * d), q_src), dim=-1)
-        else:
-            q_t = q_src
+        q_t = F.normalize(
+            quat_mul(so3_exp_to_quat(w_sel * d), F.normalize(g_sel[..., 6:10], dim=-1)),
+            dim=-1)
 
         scale = F.softplus(g_sel[..., 3:6])
         opac = torch.sigmoid(g_sel[..., 10:11]) * wgt.view(B, nf, 1, 1)
