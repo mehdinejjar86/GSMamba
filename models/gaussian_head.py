@@ -50,9 +50,14 @@ class GaussianHead(nn.Module):
 
     OUT_CHANNELS = 14
 
-    # Optional per-Gaussian 3D motion (velocity), appended when predict_motion=True.
+    # Optional per-Gaussian 3D motion, appended when predict_motion=True:
+    #   velocity (14:17), angular velocity (17:20), acceleration (20:23) if motion_accel.
     VELOCITY_START = 14
     VELOCITY_END = 17
+    ANGVEL_START = 17
+    ANGVEL_END = 20
+    ACCEL_START = 20
+    ACCEL_END = 23
 
     def __init__(
             self,
@@ -62,12 +67,16 @@ class GaussianHead(nn.Module):
             init_scale: float = 0.01,
             init_opacity: float = -2.0,
             predict_motion: bool = False,
+            motion_accel: bool = False,
     ):
         super().__init__()
 
         hidden_channels = hidden_channels or in_channels
         self.predict_motion = predict_motion
-        out_channels = self.OUT_CHANNELS + (3 if predict_motion else 0)
+        self.motion_accel = predict_motion and motion_accel
+        # motion channels: velocity(3) + angular velocity(3) [+ acceleration(3)]
+        motion_ch = (6 + (3 if self.motion_accel else 0)) if predict_motion else 0
+        out_channels = self.OUT_CHANNELS + motion_ch
 
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, 3, 1, 1)
         self.act = nn.GELU()
@@ -144,9 +153,13 @@ class GaussianHead(nn.Module):
         }
 
         if self.predict_motion:
-            # Per-Gaussian 3D velocity (linear, same space as xyz). Bias-init 0 so
-            # synthesis starts motion-free and learns motion from photometric + gflow.
+            # Per-Gaussian motion (bias-init 0 -> starts motion-free, learned from
+            # photometric + gflow). velocity & angular velocity advect/rotate Gaussians
+            # to t; optional acceleration gives a quadratic path.
             params['velocity'] = out[:, self.VELOCITY_START:self.VELOCITY_END]
+            params['angular_velocity'] = out[:, self.ANGVEL_START:self.ANGVEL_END]
+            if self.motion_accel:
+                params['acceleration'] = out[:, self.ACCEL_START:self.ACCEL_END]
 
         return params
 
@@ -170,6 +183,7 @@ class MultiScaleGaussianHead(nn.Module):
             out_resolution: Tuple[int, int] = (256, 256),
             fusion_channels: int = 64,
             predict_motion: bool = False,
+            motion_accel: bool = False,
     ):
         super().__init__()
 
@@ -189,7 +203,8 @@ class MultiScaleGaussianHead(nn.Module):
             nn.GELU(),
         )
 
-        self.head = GaussianHead(fusion_channels, predict_motion=predict_motion)
+        self.head = GaussianHead(fusion_channels, predict_motion=predict_motion,
+                                 motion_accel=motion_accel)
 
     def forward(self, multi_scale_features: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -342,8 +357,9 @@ class GaussianAssembler(nn.Module):
             'color': color,
         }
 
-        # Optional per-Gaussian 3D velocity (motion synthesis). Same (B, N, 3) layout.
-        if 'velocity' in gaussian_params:
-            out['velocity'] = gaussian_params['velocity'].view(B, 3, -1).permute(0, 2, 1)
+        # Optional per-Gaussian motion fields (motion synthesis). Same (B, N, 3) layout.
+        for _mk in ('velocity', 'angular_velocity', 'acceleration'):
+            if _mk in gaussian_params:
+                out[_mk] = gaussian_params[_mk].view(B, 3, -1).permute(0, 2, 1)
 
         return out

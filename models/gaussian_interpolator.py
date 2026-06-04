@@ -97,6 +97,35 @@ def morton_encode_3d(xyz: torch.Tensor, bits: int = 10) -> torch.Tensor:
     return spread(x) | (spread(y) << 1) | (spread(z) << 2)  # (B, N) int64
 
 
+def so3_exp_to_quat(omega: torch.Tensor) -> torch.Tensor:
+    """
+    Map an axis-angle rotation vector to a unit quaternion (w, x, y, z).
+
+    omega: (..., 3) — direction = rotation axis, magnitude = rotation angle.
+    Returns (..., 4) unit quaternion. omega=0 -> identity [1, 0, 0, 0].
+    """
+    theta = omega.norm(dim=-1, keepdim=True)                  # (..., 1) angle
+    half = 0.5 * theta
+    # ratio = sin(half)/theta, with the stable small-angle limit -> 0.5
+    ratio = torch.where(theta > 1e-6, torch.sin(half) / theta.clamp(min=1e-6),
+                        torch.full_like(theta, 0.5))
+    w = torch.cos(half)                                       # (..., 1)
+    xyz = omega * ratio                                       # (..., 3)
+    return torch.cat([w, xyz], dim=-1)                        # (..., 4)
+
+
+def quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of quaternions (w, x, y, z), broadcasting over leading dims."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return torch.stack([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], dim=-1)
+
+
 class NFrameGaussianMamba(nn.Module):
     """
     Mamba SSM over the merged N-frame Gaussian cloud.
@@ -120,8 +149,10 @@ class NFrameGaussianMamba(nn.Module):
 
     GAUSSIAN_DIM = 14  # xyz(3) + scale(3) + rotation(4) + opacity(1) + color(3)
 
-    def __init__(self, d_state: int = 16, expand: int = 2, num_layers: int = 2):
+    def __init__(self, d_state: int = 16, expand: int = 2, num_layers: int = 2,
+                 motion_frames_k: int = 0):
         super().__init__()
+        self.motion_frames_k = motion_frames_k
         D = self.GAUSSIAN_DIM
         self.pos_encoding = TemporalPositionEncoding(D, max_len=100)
         self.layers = nn.ModuleList([
@@ -255,43 +286,72 @@ class NFrameGaussianMamba(nn.Module):
 
         # ---- Motion synthesis (predict_motion): forward-warp + merge ----
         # Unsort each frame's refined block back to pixel order so it aligns with the
-        # per-pixel velocities (which bypass the Mamba), advect each bounding frame to
-        # time t by its own velocity, and merge both warped clouds.  Correspondence-free:
-        # each frame moves its own Gaussians; the rasterizer composites by depth.
+        # per-pixel motion fields (which bypass the Mamba), advect+rotate every (or the K
+        # nearest) frame's Gaussians to time t, and merge the warped clouds weighted by
+        # temporal proximity.  Correspondence-free: each frame moves its own Gaussians;
+        # the rasterizer composites by depth (handles motion, rotation, disocclusion).
         refined = []
         for n in range(N):
             block_n = all_params[:, n * HW:(n + 1) * HW, :]        # (B, HW, 14) sorted
             inv = perms[n].argsort(dim=1)                          # inverse perm -> pixel order
             refined.append(block_n.gather(1, inv.unsqueeze(-1).expand_as(block_n)))
         refined = torch.stack(refined, dim=0)                      # (N, B, HW, 14) pixel order
+
         vel = torch.stack([g['velocity'] for g in gaussians_list], dim=0)  # (N, B, HW, 3)
+        ang = (torch.stack([g['angular_velocity'] for g in gaussians_list], dim=0)
+               if 'angular_velocity' in gaussians_list[0] else None)
+        acc = (torch.stack([g['acceleration'] for g in gaussians_list], dim=0)
+               if 'acceleration' in gaussians_list[0] else None)
 
-        bo = torch.arange(B, device=device)
-        g0 = refined[idx0, bo]                                     # (B, HW, 14)
-        g1 = refined[idx1, bo]
-        v0 = vel[idx0, bo]                                         # (B, HW, 3)
-        v1 = vel[idx1, bo]
+        # Per-frame time delta to the (unclamped) query time t:  Δ_n = t - t_n
+        if not torch.is_tensor(t):
+            tq = torch.full((B,), float(t), device=device, dtype=timestamps.dtype)
+        else:
+            tq = t.to(device=device, dtype=timestamps.dtype).reshape(-1)
+            if tq.numel() == 1:
+                tq = tq.expand(B)
+        delta = tq.view(B, 1) - timestamps                        # (B, N)
 
-        t0 = timestamps.gather(1, idx0.view(B, 1)).view(B, 1, 1)
-        t1 = timestamps.gather(1, idx1.view(B, 1)).view(B, 1, 1)
-        dt = t1 - t0                                               # (B, 1, 1)
+        # Frames to warp: all N, or the K nearest to t (per batch element).
+        K = self.motion_frames_k
+        if K and 0 < K < N:
+            sel = (-delta.abs()).topk(K, dim=1).indices           # (B, K)
+        else:
+            sel = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
+        nf = sel.shape[1]
+        bo = torch.arange(B, device=device).view(B, 1)            # (B, 1), broadcasts with sel
 
-        # Advect positions to query time t:  x(t) = x_n + v_n * (t - t_n)
-        xyz0 = g0[..., :3] + v0 * (a * dt)                         # (t - t0) = alpha * dt
-        xyz1 = g1[..., :3] + v1 * ((a - 1.0) * dt)                 # (t - t1) = (alpha-1) * dt
+        g_sel = refined[sel, bo]                                   # (B, nf, HW, 14)
+        v_sel = vel[sel, bo]                                       # (B, nf, HW, 3)
+        a_sel = acc[sel, bo] if acc is not None else None
+        w_sel = ang[sel, bo] if ang is not None else None
+        d_sel = delta.gather(1, sel)                              # (B, nf)
 
-        def _emit(g, xyz, w):
-            return {
-                'xyz': xyz,
-                'scale': F.softplus(g[..., 3:6]),
-                'rotation': F.normalize(g[..., 6:10], dim=-1),
-                # temporal weight: the nearer bounding frame contributes more (w in [0,1])
-                'opacity': torch.sigmoid(g[..., 10:11]) * w,
-                'color': torch.sigmoid(g[..., 11:14]),
-            }
+        # Temporal-proximity opacity weights over the selected frames.
+        wgt = torch.softmax(-d_sel.abs() / 0.1, dim=1)           # (B, nf)
+        d = d_sel.view(B, nf, 1, 1)                               # broadcast over (HW, ·)
 
-        warp0 = _emit(g0, xyz0, 1.0 - a)
-        warp1 = _emit(g1, xyz1, a)
+        # Advect positions: x(t) = x_n + v_n·Δ (+ ½·a_n·Δ²)
+        xyz = g_sel[..., :3] + v_sel * d
+        if a_sel is not None:
+            xyz = xyz + 0.5 * a_sel * (d * d)
 
-        # Merge both forward-warped clouds (2·HW Gaussians); rasterizer composites by depth.
-        return {k: torch.cat([warp0[k], warp1[k]], dim=1) for k in warp0}
+        # Rotate orientations to t: q(t) = exp(ω_n·Δ) ⊗ q_n
+        q_src = F.normalize(g_sel[..., 6:10], dim=-1)            # (B, nf, HW, 4)
+        if w_sel is not None:
+            q_t = F.normalize(quat_mul(so3_exp_to_quat(w_sel * d), q_src), dim=-1)
+        else:
+            q_t = q_src
+
+        scale = F.softplus(g_sel[..., 3:6])
+        opac = torch.sigmoid(g_sel[..., 10:11]) * wgt.view(B, nf, 1, 1)
+        color = torch.sigmoid(g_sel[..., 11:14])
+
+        # Merge the nf warped clouds -> (B, nf·HW, ·); rasterizer composites by depth.
+        return {
+            'xyz':      xyz.reshape(B, nf * HW, 3),
+            'scale':    scale.reshape(B, nf * HW, 3),
+            'rotation': q_t.reshape(B, nf * HW, 4),
+            'opacity':  opac.reshape(B, nf * HW, 1),
+            'color':    color.reshape(B, nf * HW, 3),
+        }

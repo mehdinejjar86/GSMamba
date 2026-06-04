@@ -75,6 +75,7 @@ class GSMamba(nn.Module):
             out_resolution=config.image_size,
             fusion_channels=config.embed_dims[0] * 2,
             predict_motion=getattr(config, 'predict_motion', False),
+            motion_accel=getattr(config, 'motion_accel', False),
         )
 
         # 4. Gaussian Assembler (2D predictions -> 3D Gaussians)
@@ -89,6 +90,7 @@ class GSMamba(nn.Module):
             d_state=config.d_state,
             expand=2,
             num_layers=config.temporal_num_layers,
+            motion_frames_k=getattr(config, 'motion_frames_k', 0),
         )
 
         # 6. Differentiable Gaussian Renderer
