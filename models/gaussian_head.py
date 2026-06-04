@@ -326,7 +326,3 @@ class GaussianAssembler(nn.Module):
             'opacity': opacity,
             'color': color,
         }
-
-    def get_pixel_coords(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get pixel coordinate grids."""
-        return self.grid_x, self.grid_y

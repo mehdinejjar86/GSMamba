@@ -35,10 +35,9 @@ from config import GSMambaSmallConfig
 from data.utils import create_eval_loader
 from data.vimeo import VimeoTriplet, vimeo_collate
 from data.x4k import X4K1000Dataset
-from models.gaussian_interpolator import GaussianInterpolator, NFrameGaussianMamba
+from models.gaussian_interpolator import NFrameGaussianMamba
 from models.gs_mamba import GSMamba
 from models.renderer import GaussianRenderer, RASTERIZER_AVAILABLE
-from models.temporal_fusion import HybridTemporalFusion
 from modules.ss2d import SS2D
 from train import evaluate
 
@@ -130,28 +129,6 @@ def case_interpolator_shapes(ctx: SmokeContext) -> None:
         _assert_finite(f"{name}.opacity", out["opacity"])
 
     print(f"NFrameGaussianMamba outputs correct shapes and unit quaternions for B={B}, N={N}, HW={HW}")
-
-
-def case_hybrid_temporal_fusion(ctx: SmokeContext) -> None:
-    _banner("Hybrid Temporal Fusion")
-    B, N, C, H, W = 2, 3, 16, 8, 8
-    device = ctx.device
-
-    module = HybridTemporalFusion(
-        dim=C,
-        num_ssm_layers=2,
-        num_attn_layers=1,
-        d_state=8,
-        num_heads=4,
-    ).to(device).eval()
-
-    x = torch.randn(B, N, C, H, W, device=device)
-    timestamps = torch.tensor([[0.0, 0.5, 1.0], [0.0, 0.25, 1.0]], device=device)
-    y = module(x, timestamps)
-    if tuple(y.shape) != tuple(x.shape):
-        raise AssertionError(f"shape mismatch: got {tuple(y.shape)}, expected {tuple(x.shape)}")
-    _assert_finite("hybrid_temporal_fusion_output", y)
-    print(f"fusion output shape={tuple(y.shape)}")
 
 
 def case_ss2d(ctx: SmokeContext) -> None:
@@ -423,7 +400,7 @@ def case_x4k_sample(ctx: SmokeContext) -> None:
 
 def case_slerp_correctness(ctx: SmokeContext) -> None:
     _banner("SLERP Correctness")
-    from models.gaussian_interpolator import GaussianInterpolator
+    from models.gaussian_interpolator import NFrameGaussianMamba
 
     device = ctx.device
     B, P = 4, 16
@@ -434,9 +411,9 @@ def case_slerp_correctness(ctx: SmokeContext) -> None:
     alpha1    = torch.ones(B, 1, 1, device=device)
     alpha_mid = torch.full((B, 1, 1), 0.5, device=device)
 
-    out0    = GaussianInterpolator._slerp(q0, q1, alpha0)
-    out1    = GaussianInterpolator._slerp(q0, q1, alpha1)
-    out_mid = GaussianInterpolator._slerp(q0, q1, alpha_mid)
+    out0    = NFrameGaussianMamba._slerp(q0, q1, alpha0)
+    out1    = NFrameGaussianMamba._slerp(q0, q1, alpha1)
+    out_mid = NFrameGaussianMamba._slerp(q0, q1, alpha_mid)
 
     # t=0 → q0
     if not torch.allclose(out0, q0, atol=1e-5):
@@ -450,48 +427,12 @@ def case_slerp_correctness(ctx: SmokeContext) -> None:
     if not torch.allclose(norms, torch.ones_like(norms), atol=1e-5):
         raise AssertionError(f"slerp output not unit norm: max_err={float((norms - 1).abs().max()):.2e}")
     # Shortest arc: slerp(q, -q, 0.5) → unit result (not zero vector)
-    out_neg = GaussianInterpolator._slerp(q0, -q0, alpha_mid)
+    out_neg = NFrameGaussianMamba._slerp(q0, -q0, alpha_mid)
     norms_neg = out_neg.norm(dim=-1)
     if not torch.allclose(norms_neg, torch.ones_like(norms_neg), atol=1e-4):
         raise AssertionError("slerp shortest-arc failed: output not unit norm")
     _assert_finite("slerp_output", out_mid)
     print("slerp: endpoints correct, unit-norm, shortest-arc OK")
-
-
-def case_flow_guided_warping(ctx: SmokeContext) -> None:
-    _banner("Flow-Guided Gaussian Warping")
-    from models.gaussian_interpolator import GaussianInterpolator
-
-    device = ctx.device
-    B, H, W = 2, 16, 16
-    N = H * W
-
-    gaussians = []
-    for _ in range(2):
-        gaussians.append({
-            "xyz":      torch.randn(B, N, 3, device=device),
-            "scale":    torch.rand(B, N, 3, device=device) * 0.1 + 1e-3,
-            "rotation": F.normalize(torch.randn(B, N, 4, device=device), dim=-1),
-            "opacity":  torch.sigmoid(torch.randn(B, N, 1, device=device)),
-            "color":    torch.sigmoid(torch.randn(B, N, 3, device=device)),
-        })
-
-    interp = GaussianInterpolator(hidden_dim=32, num_layers=1).to(device).eval()
-    timestamps = torch.tensor([0.0, 1.0], device=device)
-
-    with torch.no_grad():
-        out_base = interp(gaussians, t=0.5, timestamps=timestamps)
-        zero_flow = torch.zeros(B, 4, H, W, device=device)
-        out_zero  = interp(gaussians, t=0.5, timestamps=timestamps, flow=zero_flow)
-        rand_flow = torch.randn(B, 4, H, W, device=device) * 2.0
-        out_rand  = interp(gaussians, t=0.5, timestamps=timestamps, flow=rand_flow)
-
-    if not torch.allclose(out_base['xyz'], out_zero['xyz'], atol=1e-4):
-        raise AssertionError("Zero flow warp should match no-flow baseline")
-    if torch.allclose(out_rand['xyz'], out_base['xyz'], atol=1e-4):
-        raise AssertionError("Non-zero flow should change interpolation output")
-    _assert_finite("flow_warped_xyz", out_rand['xyz'])
-    print("flow warping: zero-flow=identity, non-zero-flow changes output")
 
 
 def case_gaussian_head_channels(ctx: SmokeContext) -> None:
@@ -614,7 +555,6 @@ def main() -> int:
     cases: List[Tuple[str, Callable[[SmokeContext], None]]] = [
         ("environment", case_env),
         ("interpolator_shapes", case_interpolator_shapes),
-        ("hybrid_temporal_fusion", case_hybrid_temporal_fusion),
         ("ss2d_forward", case_ss2d),
         ("renderer_forward", case_renderer),
         ("model_forward", case_model_forward),
@@ -622,7 +562,6 @@ def main() -> int:
         ("train_help", case_train_help),
         ("validation_synthetic_loop", case_validation_synthetic),
         ("slerp_correctness", case_slerp_correctness),
-        ("flow_guided_warping", case_flow_guided_warping),
         ("gaussian_head_channels", case_gaussian_head_channels),
         ("curriculum_schedule", case_curriculum_schedule),
     ]

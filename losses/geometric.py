@@ -138,69 +138,6 @@ class TemporalConsistencyLoss(nn.Module):
         return self.motion_weight * motion_loss
 
 
-class MultiViewConsistencyLoss(nn.Module):
-    """
-    Multi-view consistency loss.
-
-    Encourages consistent depth predictions across multiple frames
-    by checking that reprojected points match.
-
-    Args:
-        threshold: Distance threshold for valid correspondences (default: 0.1)
-    """
-
-    def __init__(self, threshold: float = 0.1):
-        super().__init__()
-        self.threshold = threshold
-
-    def forward(
-            self,
-            gaussians_list: List[Dict[str, torch.Tensor]],
-    ) -> torch.Tensor:
-        """
-        Compute multi-view consistency loss.
-
-        For corresponding Gaussians across frames, their 3D positions
-        should be consistent (accounting for motion).
-
-        Args:
-            gaussians_list: List of Gaussian dicts for each frame
-
-        Returns:
-            Consistency loss
-        """
-        N = len(gaussians_list)
-
-        if N < 2:
-            return torch.tensor(0.0, device=gaussians_list[0]['xyz'].device)
-
-        loss = 0.0
-        count = 0
-
-        # Compare adjacent frames
-        for i in range(N - 1):
-            xyz_i = gaussians_list[i]['xyz']  # (B, num_points, 3)
-            xyz_j = gaussians_list[i + 1]['xyz']
-
-            # Motion between frames
-            motion = xyz_j - xyz_i
-
-            # Penalize large sudden motions (outliers)
-            motion_norm = motion.norm(dim=-1)
-            outlier_mask = motion_norm > self.threshold
-
-            if outlier_mask.any():
-                # Soft penalty for outlier motions
-                outlier_loss = (motion_norm[outlier_mask] - self.threshold).mean()
-                loss = loss + outlier_loss
-                count += 1
-
-        if count > 0:
-            loss = loss / count
-
-        return loss
-
-
 class OpacityRegularizationLoss(nn.Module):
     """
     Opacity regularization to prevent trivial solutions.

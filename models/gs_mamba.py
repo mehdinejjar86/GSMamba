@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from config import GSMambaConfig
 from models.feature_encoder import FeatureEncoder
 from models.gaussian_head import GaussianHead, GaussianAssembler, MultiScaleGaussianHead
-from models.gaussian_interpolator import GaussianInterpolator, NFrameGaussianMamba
+from models.gaussian_interpolator import NFrameGaussianMamba
 from models.renderer import GaussianRenderer
 from models.refine import UNetRefine
 
@@ -103,7 +103,6 @@ class GSMamba(nn.Module):
             self.refine = UNetRefine(
                 base_channels=config.refine_channels,
                 in_frames=2,  # Use 2 nearest frames for refinement
-                use_features=False,
             )
 
     def _set_runtime_image_size(self, image_size: Tuple[int, int]):
@@ -126,61 +125,34 @@ class GSMamba(nn.Module):
             self,
             frames: torch.Tensor,
             timestamps: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[List[torch.Tensor]], List[Dict[str, torch.Tensor]]]:
+    ) -> List[Dict[str, torch.Tensor]]:
         """
-        Encode N frames to multi-scale features and Gaussians.
+        Encode N frames to per-frame 3D Gaussians.
 
         Args:
             frames: Input frames (B, N, 3, H, W)
-            timestamps: Frame timestamps (B, N) in [0, 1]
+            timestamps: Accepted for call-site compatibility (unused here).
 
         Returns:
-            Tuple of:
-                - Multi-scale fused features for each frame
-                - List of N Gaussian dicts
+            List of N Gaussian dicts.
         """
         B, N, C, H, W = frames.shape
-        device = frames.device
         if (H, W) != tuple(self.config.image_size):
             self._set_runtime_image_size((H, W))
 
-        # Default timestamps: uniform spacing
-        if timestamps is None:
-            timestamps = torch.linspace(0, 1, N, device=device).unsqueeze(0).expand(B, -1)
-
-        # Extract per-frame features (shared encoder)
+        # Extract per-frame multi-scale features (shared encoder).
+        # No feature-level temporal fusion — cross-frame context is handled by
+        # NFrameGaussianMamba in Gaussian parameter space (cheaper, no OOM).
         all_features = self.encoder(frames)  # List of N feature lists
 
-        # Reorganize: for each scale, stack features from all N frames
-        # all_features[n][s] -> features[s] of shape (B, N, C_s, H_s, W_s)
-        num_scales = len(self.config.embed_dims)
-        multi_scale_features = []
-
-        for s in range(num_scales):
-            scale_features = torch.stack(
-                [all_features[n][s] for n in range(N)],
-                dim=1
-            )  # (B, N, C_s, H_s, W_s)
-            multi_scale_features.append(scale_features)
-
-        # No feature-level temporal fusion — cross-frame context is handled
-        # by NFrameGaussianMamba in Gaussian parameter space (cheaper, no OOM).
-        fused_features = multi_scale_features
-
-        # Predict Gaussians for each frame
+        # Predict per-pixel Gaussians for each frame directly from its features.
         gaussians_list = []
         for n in range(N):
-            # Get features for frame n at each scale
-            frame_features = [fused_features[s][:, n] for s in range(num_scales)]
-
-            # Predict per-pixel Gaussian parameters
-            gaussian_params = self.gaussian_head(frame_features)
-
-            # Assemble to 3D Gaussians
+            gaussian_params = self.gaussian_head(all_features[n])
             gaussians = self.gaussian_assembler(gaussian_params)
             gaussians_list.append(gaussians)
 
-        return fused_features, gaussians_list
+        return gaussians_list
 
     def interpolate_and_render(
             self,
@@ -279,7 +251,7 @@ class GSMamba(nn.Module):
             flow = flow_list[-1]  # (B, 4, H, W): fwd=[:, :2], bwd=[:, 2:4]
 
         # Encode frames and get Gaussians
-        fused_features, gaussians_list = self.encode_frames(frames, timestamps)
+        gaussians_list = self.encode_frames(frames, timestamps)
 
         # Interpolate (with flow-guided warp if available) and render
         render_output = self.interpolate_and_render(gaussians_list, t_tensor, timestamps, flow=flow)
@@ -315,7 +287,6 @@ class GSMamba(nn.Module):
         if return_intermediates:
             output['gaussians'] = render_output['gaussians']
             output['all_gaussians'] = gaussians_list
-            output['fused_features'] = fused_features
 
         return output
 
@@ -339,61 +310,6 @@ class GSMamba(nn.Module):
         with torch.no_grad():
             output = self.forward(frames, t, timestamps, return_intermediates=False)
         return output['pred']
-
-    def multi_frame_inference(
-            self,
-            frames: torch.Tensor,
-            num_interpolations: int = 1,
-            timestamps: Optional[torch.Tensor] = None,
-    ) -> List[torch.Tensor]:
-        """
-        Generate multiple interpolated frames.
-
-        Args:
-            frames: Input frames (B, N, 3, H, W)
-            num_interpolations: Number of frames to interpolate between each pair
-            timestamps: Frame timestamps
-
-        Returns:
-            List of interpolated frames
-        """
-        B, N, C, H, W = frames.shape
-        device = frames.device
-
-        if timestamps is None:
-            timestamps = torch.linspace(0, 1, N, device=device).unsqueeze(0).expand(B, -1)
-
-        # Encode once
-        with torch.no_grad():
-            fused_features, gaussians_list = self.encode_frames(frames, timestamps)
-
-        # Generate interpolated frames
-        interpolated = []
-        for i in range(N - 1):
-            t_start = timestamps[0, i].item()
-            t_end = timestamps[0, i + 1].item()
-
-            for j in range(1, num_interpolations + 1):
-                t = t_start + (t_end - t_start) * j / (num_interpolations + 1)
-
-                with torch.no_grad():
-                    render_output = self.interpolate_and_render(gaussians_list, t, timestamps)
-
-                    if self.use_refinement:
-                        nearest_frames = frames[:, [i, i + 1]]
-                        opacity_map = torch.ones(B, 1, H, W, device=device)
-                        pred = self.refine(
-                            rendered=render_output['render'],
-                            depth=render_output['depth'],
-                            opacity=opacity_map,
-                            input_frames=nearest_frames,
-                        )
-                    else:
-                        pred = render_output['render']
-
-                interpolated.append(pred)
-
-        return interpolated
 
 
 def build_model(config_name: str = "gsmamba") -> GSMamba:

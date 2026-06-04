@@ -100,9 +100,6 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
-        # Optimized kernel is available only on CUDA tensors.
-        self.selective_scan = selective_scan_fn if selective_scan_fn else self._selective_scan_ref
-
     @staticmethod
     def _init_dt_bias(d_inner, copies=4, dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4, **factory_kwargs):
         """Initialize delta bias for stable training."""
