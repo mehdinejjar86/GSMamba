@@ -150,11 +150,13 @@ class NFrameGaussianMamba(nn.Module):
     GAUSSIAN_DIM = 14  # xyz(3) + scale(3) + rotation(4) + opacity(1) + color(3)
 
     def __init__(self, d_state: int = 16, expand: int = 2, num_layers: int = 2,
-                 motion_frames_k: int = 0, feat_dim: int = 0, motion_accel: bool = False):
+                 motion_frames_k: int = 0, feat_dim: int = 0, motion_accel: bool = False,
+                 motion_temporal_tau: float = 1.0):
         super().__init__()
         self.motion_frames_k = motion_frames_k
         self.feat_dim = feat_dim                       # per-Gaussian latent width (Phase 4); 0 = off
         self.motion_accel = motion_accel
+        self.motion_temporal_tau = motion_temporal_tau
         D = self.GAUSSIAN_DIM + feat_dim               # token = params(14) [+ latent(F)]
         self.D = D
         self.pos_encoding = TemporalPositionEncoding(D, max_len=100)
@@ -239,128 +241,117 @@ class NFrameGaussianMamba(nn.Module):
         elif timestamps.dim() == 2 and timestamps.shape[0] == 1 and B > 1:
             timestamps = timestamps.expand(B, -1)
 
-        use_motion = self.feat_dim > 0   # Phase 4: latent-augmented mixing + Mamba motion head
+        # ---- Default path (no latent / no motion): per-frame Morton-sort, block-concat,
+        # SSM, 2-frame Morton-rank blend.  Unchanged & checkpoint-safe. ----
+        if self.feat_dim == 0:
+            sorted_frames = []
+            for n in range(N):
+                params_n = torch.cat([
+                    gaussians_list[n]['xyz'], gaussians_list[n]['scale'],
+                    gaussians_list[n]['rotation'], gaussians_list[n]['opacity'],
+                    gaussians_list[n]['color'],
+                ], dim=-1)                                          # (B, HW, 14)
+                codes = morton_encode_3d(params_n[..., :3])
+                perm = codes.argsort(dim=1)
+                sorted_frames.append(params_n.gather(1, perm.unsqueeze(-1).expand_as(params_n)))
+            all_params = torch.cat(sorted_frames, dim=1)           # (B, N·HW, 14)
+            ts_per_pos = timestamps.unsqueeze(-1).expand(B, N, HW).reshape(B, N * HW)
+            all_params = self.pos_encoding(all_params, ts_per_pos)
+            for layer in self.layers:
+                all_params = layer(all_params)
+            all_params = self.norm(all_params)
 
-        # Per-Gaussian token = 14 params [+ F latent when motion is on].
-        pack_keys = ['xyz', 'scale', 'rotation', 'opacity', 'color']
-        if use_motion:
-            pack_keys.append('feat')
-
-        # Pack each frame sorted by 3D Morton code so spatially proximate Gaussians
-        # from different frames become adjacent in the Mamba sequence.  Keep the
-        # permutations so we can unsort back to pixel order for motion synthesis.
-        sorted_frames = []
-        perms = []
-        for n in range(N):
-            params_n = torch.cat([gaussians_list[n][k] for k in pack_keys], dim=-1)  # (B, HW, D)
-            codes = morton_encode_3d(params_n[..., :3])            # (B, HW) — xyz only
-            perm  = codes.argsort(dim=1)                           # (B, HW)
-            perms.append(perm)
-            sorted_frames.append(
-                params_n.gather(1, perm.unsqueeze(-1).expand_as(params_n))
-            )
-        all_params = torch.cat(sorted_frames, dim=1)               # (B, N·HW, D)
-
-        # Temporal position encoding — each HW block shares its frame's timestamp
-        ts_per_pos = timestamps.unsqueeze(-1).expand(B, N, HW).reshape(B, N * HW)
-        all_params = self.pos_encoding(all_params, ts_per_pos)
-
-        # Mamba refinement: (B, N·HW, 14) — CUDA kernel, O(D·N) state
-        for layer in self.layers:
-            all_params = layer(all_params)
-        all_params = self.norm(all_params)
-
-        # Find the two bounding frames for time t
-        idx0, idx1, alpha = _find_bounding_frames(t, timestamps)
-        a = alpha.view(B, 1, 1)  # broadcast over (HW, C)
-
-        if not use_motion:
-            # ---- Default synthesis: blend the two Morton-sorted bounding blocks ----
+            idx0, idx1, alpha = _find_bounding_frames(t, timestamps)
+            a = alpha.view(B, 1, 1)
             g0 = torch.stack([all_params[b, idx0[b] * HW:(idx0[b] + 1) * HW] for b in range(B)])
             g1 = torch.stack([all_params[b, idx1[b] * HW:(idx1[b] + 1) * HW] for b in range(B)])
-
-            xyz_t   = (1 - a) * g0[..., :3]   + a * g1[..., :3]
-            scale_t = F.softplus((1 - a) * g0[..., 3:6]  + a * g1[..., 3:6])
-            rot_t   = self._slerp(
-                          F.normalize(g0[..., 6:10], dim=-1),
-                          F.normalize(g1[..., 6:10], dim=-1),
-                          a)
-            opac_t  = torch.sigmoid((1 - a) * g0[..., 10:11] + a * g1[..., 10:11])
-            color_t = torch.sigmoid((1 - a) * g0[..., 11:14] + a * g1[..., 11:14])
-
             return {
-                'xyz': xyz_t,
-                'scale': scale_t,
-                'rotation': rot_t,
-                'opacity': opac_t,
-                'color': color_t,
+                'xyz':      (1 - a) * g0[..., :3] + a * g1[..., :3],
+                'scale':    F.softplus((1 - a) * g0[..., 3:6] + a * g1[..., 3:6]),
+                'rotation': self._slerp(F.normalize(g0[..., 6:10], dim=-1),
+                                        F.normalize(g1[..., 6:10], dim=-1), a),
+                'opacity':  torch.sigmoid((1 - a) * g0[..., 10:11] + a * g1[..., 10:11]),
+                'color':    torch.sigmoid((1 - a) * g0[..., 11:14] + a * g1[..., 11:14]),
             }
 
-        # ---- Motion synthesis (Phase 4): mixed-token motion head + forward-warp + merge ----
-        # Unsort each frame's cross-frame-mixed token back to pixel order, read per-Gaussian
-        # motion from the mixed token (the motion head), advect+rotate every (or the K nearest)
-        # frame's Gaussians to time t, and merge the warped clouds weighted by temporal
-        # proximity.  The rasterizer composites by depth (motion, rotation, disocclusion).
-        refined = []
-        for n in range(N):
-            block_n = all_params[:, n * HW:(n + 1) * HW, :]        # (B, HW, D) sorted
-            inv = perms[n].argsort(dim=1)                          # inverse perm -> pixel order
-            refined.append(block_n.gather(1, inv.unsqueeze(-1).expand_as(block_n)))
-        refined = torch.stack(refined, dim=0)                      # (N, B, HW, D) pixel order
-
-        # Per-Gaussian motion read from the cross-frame-mixed tokens.
-        motion = self.motion_head(refined)                         # (N, B, HW, 6 or 9)
-        vel = motion[..., 0:3]
-        ang = motion[..., 3:6]
-        acc = motion[..., 6:9] if self.motion_accel else None
-
-        # Per-frame time delta to the (unclamped) query time t:  Δ_n = t - t_n
+        # ---- Motion path (Phase 4): JOINT Morton ordering + latent mixing + motion head ----
+        # A joint Morton sort over ALL selected frames' Gaussians makes correspondences
+        # (and static content) adjacent in the sequence — not block-separated by frame — so
+        # the SSM can actually mix them.  Δ uses each token's ACTUAL timestamp, so
+        # non-uniform frame spacing is handled correctly.
         if not torch.is_tensor(t):
             tq = torch.full((B,), float(t), device=device, dtype=timestamps.dtype)
         else:
             tq = t.to(device=device, dtype=timestamps.dtype).reshape(-1)
             if tq.numel() == 1:
                 tq = tq.expand(B)
-        delta = tq.view(B, 1) - timestamps                        # (B, N)
 
-        # Frames to warp: all N, or the K nearest to t (per batch element).
+        # Per-frame packed tokens [params(14) + feat(F)] -> (N, B, HW, D)
+        per_frame = torch.stack([
+            torch.cat([gaussians_list[n]['xyz'], gaussians_list[n]['scale'],
+                       gaussians_list[n]['rotation'], gaussians_list[n]['opacity'],
+                       gaussians_list[n]['color'], gaussians_list[n]['feat']], dim=-1)
+            for n in range(N)
+        ], dim=0)                                                  # (N, B, HW, D)
+
+        # Choose frames to advect+merge: all N, or the K nearest to t (per batch element).
+        delta_f = tq.view(B, 1) - timestamps                       # (B, N)
         K = self.motion_frames_k
         if K and 0 < K < N:
-            sel = (-delta.abs()).topk(K, dim=1).indices           # (B, K)
+            sel = (-delta_f.abs()).topk(K, dim=1).indices          # (B, M)
         else:
             sel = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
-        nf = sel.shape[1]
-        bo = torch.arange(B, device=device).view(B, 1)            # (B, 1), broadcasts with sel
+        M = sel.shape[1]
+        bo = torch.arange(B, device=device).view(B, 1)
+        tok_f = per_frame[sel, bo]                                 # (B, M, HW, D)
+        ts_sel = timestamps.gather(1, sel)                         # (B, M)
 
-        g_sel = refined[sel, bo]                                   # (B, nf, HW, D)  (use [:14])
-        v_sel = vel[sel, bo]                                       # (B, nf, HW, 3)
-        w_sel = ang[sel, bo]                                       # (B, nf, HW, 3)
-        a_sel = acc[sel, bo] if acc is not None else None
-        d_sel = delta.gather(1, sel)                              # (B, nf)
+        # Spacing-aware temporal opacity weight over selected frames (convex; tau<=0 -> uniform).
+        if self.motion_temporal_tau > 0:
+            avg_gap = ((timestamps.amax(dim=1) - timestamps.amin(dim=1)).clamp(min=1e-6)
+                       / max(N - 1, 1))                            # (B,)
+            tau_scale = (self.motion_temporal_tau * avg_gap).view(B, 1).clamp(min=1e-6)
+            fw = torch.softmax(-(tq.view(B, 1) - ts_sel).abs() / tau_scale, dim=1)  # (B, M)
+        else:
+            fw = torch.full((B, M), 1.0 / M, device=device, dtype=timestamps.dtype)
 
-        # Temporal-proximity opacity weights over the selected frames.
-        wgt = torch.softmax(-d_sel.abs() / 0.1, dim=1)           # (B, nf)
-        d = d_sel.view(B, nf, 1, 1)                               # broadcast over (HW, ·)
+        # Flatten to one token set, carrying per-token timestamp + temporal weight.
+        D = self.D
+        tok = tok_f.reshape(B, M * HW, D)
+        ts_tok = ts_sel.unsqueeze(-1).expand(B, M, HW).reshape(B, M * HW)
+        w_tok = fw.unsqueeze(-1).expand(B, M, HW).reshape(B, M * HW)
 
-        # Advect positions: x(t) = x_n + v_n·Δ (+ ½·a_n·Δ²)
-        xyz = g_sel[..., :3] + v_sel * d
-        if a_sel is not None:
-            xyz = xyz + 0.5 * a_sel * (d * d)
+        # JOINT Morton sort across frames so correspondences are adjacent in the sequence.
+        codes = morton_encode_3d(tok[..., :3])                    # (B, M·HW)
+        perm = codes.argsort(dim=1)                               # (B, M·HW)
+        tok = tok.gather(1, perm.unsqueeze(-1).expand_as(tok))
+        ts_tok = ts_tok.gather(1, perm)
+        w_tok = w_tok.gather(1, perm)
 
-        # Rotate orientations to t: q(t) = exp(ω_n·Δ) ⊗ q_n
-        q_t = F.normalize(
-            quat_mul(so3_exp_to_quat(w_sel * d), F.normalize(g_sel[..., 6:10], dim=-1)),
-            dim=-1)
+        # Temporal position encoding (actual timestamps) -> SSM mix -> norm.
+        tok = self.pos_encoding(tok, ts_tok)
+        for layer in self.layers:
+            tok = layer(tok)
+        tok = self.norm(tok)
 
-        scale = F.softplus(g_sel[..., 3:6])
-        opac = torch.sigmoid(g_sel[..., 10:11]) * wgt.view(B, nf, 1, 1)
-        color = torch.sigmoid(g_sel[..., 11:14])
+        # Per-token motion from the cross-frame-mixed token.
+        motion = self.motion_head(tok)                            # (B, M·HW, 6 or 9)
+        v = motion[..., 0:3]
+        w = motion[..., 3:6]
+        acc = motion[..., 6:9] if self.motion_accel else None
 
-        # Merge the nf warped clouds -> (B, nf·HW, ·); rasterizer composites by depth.
+        # Advect + rotate each token to t by its own Δ = t - t_token.
+        d = (tq.view(B, 1) - ts_tok).unsqueeze(-1)               # (B, M·HW, 1)
+        xyz = tok[..., :3] + v * d
+        if acc is not None:
+            xyz = xyz + 0.5 * acc * (d * d)
+        q_t = F.normalize(quat_mul(so3_exp_to_quat(w * d),
+                                   F.normalize(tok[..., 6:10], dim=-1)), dim=-1)
+        scale = F.softplus(tok[..., 3:6])
+        opac = torch.sigmoid(tok[..., 10:11]) * w_tok.unsqueeze(-1)
+        color = torch.sigmoid(tok[..., 11:14])
+
+        # Merged cloud at time t (all selected, advected tokens); rasterizer composites by depth.
         return {
-            'xyz':      xyz.reshape(B, nf * HW, 3),
-            'scale':    scale.reshape(B, nf * HW, 3),
-            'rotation': q_t.reshape(B, nf * HW, 4),
-            'opacity':  opac.reshape(B, nf * HW, 1),
-            'color':    color.reshape(B, nf * HW, 3),
+            'xyz': xyz, 'scale': scale, 'rotation': q_t, 'opacity': opac, 'color': color,
         }

@@ -94,6 +94,7 @@ class GSMamba(nn.Module):
             feat_dim=(getattr(config, 'gaussian_feat_dim', 0)
                       if getattr(config, 'predict_motion', False) else 0),
             motion_accel=getattr(config, 'motion_accel', False),
+            motion_temporal_tau=getattr(config, 'motion_temporal_tau', 1.0),
         )
 
         # 6. Differentiable Gaussian Renderer
@@ -110,6 +111,8 @@ class GSMamba(nn.Module):
                 base_channels=config.refine_channels,
                 in_frames=2,  # Use 2 nearest frames for refinement
             )
+        # Feed refine a real per-pixel coverage map instead of the broadcast-mean opacity.
+        self.refine_real_coverage = getattr(config, 'refine_real_coverage', False)
 
     def _set_runtime_image_size(self, image_size: Tuple[int, int]):
         """
@@ -267,9 +270,14 @@ class GSMamba(nn.Module):
 
         # Refinement
         if self.use_refinement:
-            # Compute opacity map (sum of Gaussian opacities projected to image)
-            opacity = render_output['gaussians']['opacity'].mean(dim=1, keepdim=True)  # (B, 1)
-            opacity_map = torch.ones(B, 1, H, W, device=device) * opacity.view(B, 1, 1, 1)
+            if self.refine_real_coverage:
+                # Real per-pixel coverage from rendered depth (reveals the holes the
+                # forward-warp merge creates), instead of a broadcast scalar mean.
+                opacity_map = (depth > 0).float()
+            else:
+                # Legacy low-information map: broadcast mean Gaussian opacity.
+                opacity = render_output['gaussians']['opacity'].mean(dim=1, keepdim=True)  # (B, 1)
+                opacity_map = torch.ones(B, 1, H, W, device=device) * opacity.view(B, 1, 1, 1)
 
             pred = self.refine(
                 rendered=rendered,
