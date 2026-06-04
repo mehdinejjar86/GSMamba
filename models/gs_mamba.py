@@ -102,6 +102,7 @@ class GSMamba(nn.Module):
             image_size=config.image_size,
             fov=config.default_fov,
             sh_degree=config.sh_degree,
+            compute_alpha=getattr(config, 'refine_real_coverage', False),
         )
 
         # 7. UNet Refinement (optional)
@@ -189,11 +190,14 @@ class GSMamba(nn.Module):
         # Render
         render_output = self.renderer(gaussians_t)
 
-        return {
+        out = {
             'gaussians': gaussians_t,
             'render': render_output['render'],
             'depth': render_output['depth'],
         }
+        if 'alpha' in render_output:
+            out['alpha'] = render_output['alpha']
+        return out
 
     def forward(
             self,
@@ -270,12 +274,12 @@ class GSMamba(nn.Module):
 
         # Refinement
         if self.use_refinement:
-            if self.refine_real_coverage:
-                # Real per-pixel coverage from rendered depth (reveals the holes the
-                # forward-warp merge creates), instead of a broadcast scalar mean.
-                opacity_map = (depth > 0).float()
+            if self.refine_real_coverage and 'alpha' in render_output:
+                # Real rendered accumulated alpha/coverage map (explicit alpha pass).
+                opacity_map = render_output['alpha']
             else:
-                # Legacy low-information map: broadcast mean Gaussian opacity.
+                # Fallback (also when the rasterizer build emits no alpha): broadcast
+                # mean Gaussian opacity — low-information but always available.
                 opacity = render_output['gaussians']['opacity'].mean(dim=1, keepdim=True)  # (B, 1)
                 opacity_map = torch.ones(B, 1, H, W, device=device) * opacity.view(B, 1, 1, 1)
 

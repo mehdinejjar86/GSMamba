@@ -674,6 +674,20 @@ def main():
                         choices=['gsmamba', 'gsmamba_small', 'gsmamba_large'])
     parser.add_argument('--image_size', type=int, nargs=2, default=None)
 
+    # Motion synthesis (Phase 3/4) — reproducible enable, no config.py edits needed
+    parser.add_argument('--predict-motion', dest='predict_motion', action='store_true', default=None,
+                        help='Enable 3D-Gaussian motion synthesis (feature-augmented mixing + forward-warp)')
+    parser.add_argument('--motion-accel', dest='motion_accel', action='store_true', default=None,
+                        help='Also predict per-Gaussian acceleration (quadratic path)')
+    parser.add_argument('--motion-frames-k', dest='motion_frames_k', type=int, default=None,
+                        help='Frames to advect+merge at t (0=all N, else K nearest)')
+    parser.add_argument('--gaussian-feat-dim', dest='gaussian_feat_dim', type=int, default=None,
+                        help='Per-Gaussian latent width mixed in 3D (Phase 4)')
+    parser.add_argument('--motion-temporal-tau', dest='motion_temporal_tau', type=float, default=None,
+                        help='Temporal opacity-weight softness x avg frame gap (<=0 -> uniform)')
+    parser.add_argument('--refine-real-coverage', dest='refine_real_coverage', action='store_true', default=None,
+                        help='Feed refine a real rendered coverage/alpha map instead of the broadcast mean')
+
     # Data
     parser.add_argument('--vimeo_root', type=str, default=None,
                         help='Path to Vimeo triplet training data')

@@ -123,12 +123,15 @@ class GaussianRenderer(nn.Module):
             fov: float = 0.8,
             sh_degree: int = 0,
             bg_color: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+            compute_alpha: bool = False,
     ):
         super().__init__()
 
         self.height, self.width = image_size
         self.fov = fov
         self.sh_degree = sh_degree
+        # When True, also render an accumulated alpha/coverage map (for the refiner).
+        self.compute_alpha = compute_alpha
 
         self.register_buffer(
             'bg_color',
@@ -290,7 +293,29 @@ class GaussianRenderer(nn.Module):
 
         rendered_image = rendered_image.clamp(0, 1)
 
-        return rendered_image, depth_image
+        # Optional accumulated alpha/coverage: re-rasterize with unit colors so the output
+        # is Σ αᵢ Tᵢ ∈ [0,1] per pixel.  Robust to rasterizer builds that don't emit depth;
+        # guarded so any API mismatch just yields no alpha (caller falls back).
+        alpha_image = None
+        if self.compute_alpha:
+            try:
+                with torch.no_grad(), torch.amp.autocast('cuda', enabled=False):
+                    alpha_out = rasterizer(
+                        means3D=means3D.float(),
+                        means2D=torch.zeros_like(means3D),
+                        shs=None,
+                        colors_precomp=torch.ones_like(means3D),
+                        opacities=opacities.float(),
+                        scales=scales.float(),
+                        rotations=rotations.float(),
+                        cov3D_precomp=None,
+                    )
+                ai = alpha_out[0] if isinstance(alpha_out, (tuple, list)) else alpha_out
+                alpha_image = ai[:1].clamp(0, 1)               # (1, H, W)
+            except Exception:
+                alpha_image = None
+
+        return rendered_image, depth_image, alpha_image
 
     def _fallback_render(
             self,
@@ -333,7 +358,8 @@ class GaussianRenderer(nn.Module):
                 alpha_accum[0, y, x] += a
                 depth[0, y, x] = xyz[idx, 2]
 
-        return rendered, depth
+        alpha = alpha_accum.clamp(0, 1) if self.compute_alpha else None
+        return rendered, depth, alpha
 
     def forward(
             self,
@@ -368,22 +394,28 @@ class GaussianRenderer(nn.Module):
             B = xyz.shape[0]
             renders = []
             depths = []
+            alphas = []
 
             for b in range(B):
                 single_gaussians = {
                     k: v[b] for k, v in gaussians.items()
                 }
-                render, depth = self._render_single(single_gaussians, camera)
+                render, depth, alpha = self._render_single(single_gaussians, camera)
                 renders.append(render)
                 depths.append(depth)
+                if alpha is not None:
+                    alphas.append(alpha)
 
-            return {
+            out = {
                 'render': torch.stack(renders, dim=0),
                 'depth': torch.stack(depths, dim=0),
             }
+            if len(alphas) == B:
+                out['alpha'] = torch.stack(alphas, dim=0)
+            return out
         else:
-            render, depth = self._render_single(gaussians, camera)
-            return {
-                'render': render,
-                'depth': depth,
-            }
+            render, depth, alpha = self._render_single(gaussians, camera)
+            out = {'render': render, 'depth': depth}
+            if alpha is not None:
+                out['alpha'] = alpha
+            return out

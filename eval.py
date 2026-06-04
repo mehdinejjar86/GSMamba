@@ -684,12 +684,21 @@ def main():
 
     # Load model
     print(f"\nLoading model from {args.checkpoint}...")
-    model = build_model(args.model)
-
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if 'model' in checkpoint:
+
+    # Rebuild the EXACT trained architecture from the checkpoint's saved config when
+    # present, so motion/feature flags (predict_motion, gaussian_feat_dim, ...) don't
+    # need to be re-passed and the state_dict matches.
+    ckpt_cfg = checkpoint.get('config', None) if isinstance(checkpoint, dict) else None
+    if ckpt_cfg is not None and hasattr(ckpt_cfg, 'model'):
+        model = GSMamba(ckpt_cfg.model)
+        print("  (architecture rebuilt from checkpoint config)")
+    else:
+        model = build_model(args.model)
+
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
         model.load_state_dict(checkpoint['model'])
-    elif 'model_state_dict' in checkpoint:
+    elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model.load_state_dict(checkpoint)

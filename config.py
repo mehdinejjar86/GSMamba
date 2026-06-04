@@ -320,6 +320,20 @@ def update_config_from_args(config: FullConfig, args) -> FullConfig:
     if hasattr(args, 'image_size') and args.image_size:
         config.model.image_size = tuple(args.image_size)
 
+    # Motion synthesis (Phase 3/4) flags — enable reproducibly from the CLI (no source edits).
+    if getattr(args, 'predict_motion', None):
+        config.model.predict_motion = True
+    if getattr(args, 'motion_accel', None):
+        config.model.motion_accel = True
+    if getattr(args, 'refine_real_coverage', None):
+        config.model.refine_real_coverage = True
+    if getattr(args, 'motion_frames_k', None) is not None:
+        config.model.motion_frames_k = int(args.motion_frames_k)
+    if getattr(args, 'gaussian_feat_dim', None) is not None:
+        config.model.gaussian_feat_dim = int(args.gaussian_feat_dim)
+    if getattr(args, 'motion_temporal_tau', None) is not None:
+        config.model.motion_temporal_tau = float(args.motion_temporal_tau)
+
     # Update data config
     if hasattr(args, 'vimeo_root') and args.vimeo_root:
         config.data.vimeo_root = args.vimeo_root
