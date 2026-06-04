@@ -63,6 +63,8 @@ class GSMambaLoss(nn.Module):
             w_photo: float = 1.0,
             w_ssim: float = 1.0,
             w_lap: float = 0.1,
+            w_render_l1: float = 0.5,
+            w_render_ssim: float = 0.5,
             w_lpips: float = 0.0,
             w_recon: float = 0.1,
             w_depth: float = 0.001,
@@ -85,6 +87,8 @@ class GSMambaLoss(nn.Module):
         self.w_photo = w_photo
         self.w_ssim = w_ssim
         self.w_lap = w_lap
+        self.w_render_l1 = w_render_l1
+        self.w_render_ssim = w_render_ssim
         self.w_lpips = w_lpips
         self.w_recon = w_recon
         self.w_depth = w_depth
@@ -201,6 +205,14 @@ class GSMambaLoss(nn.Module):
         raw_losses['ssim'] = self.ssim_loss(pred, target)
         raw_losses['lap'] = self.lap_loss(pred, target)
 
+        # ========== Deep supervision on the coarse render ==========
+        # Fixed-weight (outside uncertainty, like LPIPS) so the Gaussian field itself
+        # must produce the interpolated frame at t; the U-Net stays a refiner on top.
+        render_l1 = self.l1_loss(render, target)
+        render_ssim = self.ssim_loss(render, target)
+        w_render_l1_loss = self.w_render_l1 * render_l1
+        w_render_ssim_loss = self.w_render_ssim * render_ssim
+
         # ========== Perceptual Loss ==========
         # Note: LPIPS is handled separately (not in uncertainty weighting)
         # as it conflicts with PSNR/SSIM optimization
@@ -286,6 +298,11 @@ class GSMambaLoss(nn.Module):
             # Add LPIPS separately (not in uncertainty weighting)
             weighted_losses['lpips'] = lpips_loss
             total_loss = total_loss + lpips_loss
+
+            # Add coarse-render deep supervision (fixed weight, like LPIPS)
+            weighted_losses['render_l1'] = w_render_l1_loss
+            weighted_losses['render_ssim'] = w_render_ssim_loss
+            total_loss = total_loss + w_render_l1_loss + w_render_ssim_loss
         else:
             # Use fixed weights
             weighted_losses = {}
@@ -308,6 +325,8 @@ class GSMambaLoss(nn.Module):
 
             weighted_losses['opacity_reg'] = self.w_opacity_reg * raw_losses['opacity_reg']
             weighted_losses['scale_reg'] = self.w_scale_reg * raw_losses['scale_reg']
+            weighted_losses['render_l1'] = w_render_l1_loss
+            weighted_losses['render_ssim'] = w_render_ssim_loss
 
             total_loss = sum(weighted_losses.values())
 
@@ -357,6 +376,8 @@ def build_loss(loss_config, model_config=None, flow_net: Optional[nn.Module] = N
         w_photo=loss_config.w_photo,
         w_ssim=loss_config.w_ssim,
         w_lap=loss_config.w_lap,
+        w_render_l1=loss_config.w_render_l1,
+        w_render_ssim=loss_config.w_render_ssim,
         w_lpips=loss_config.w_lpips,
         w_recon=loss_config.w_recon,
         w_depth=loss_config.w_depth,

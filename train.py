@@ -305,6 +305,12 @@ def train_one_epoch(
                 mse = ((pred_metrics - target_metrics) ** 2).mean(dim=[1, 2, 3])
                 batch_psnr = (-10 * torch.log10(mse + 1e-8)).mean().item()
                 batch_ssim = (1.0 - ssim_metric(pred_metrics, target_metrics)).item()
+                # Diagnostic: PSNR of the COARSE render (pre-refinement) vs target.
+                # The gap to batch_psnr shows how much the U-Net is contributing — as
+                # the render is deep-supervised (Phase 2) this gap should shrink.
+                render_metrics = output['render'].detach().float().clamp(0, 1)
+                mse_r = ((render_metrics - target_metrics) ** 2).mean(dim=[1, 2, 3])
+                batch_render_psnr = (-10 * torch.log10(mse_r + 1e-8)).mean().item()
 
         # Backward pass
         scaler.scale(loss).backward()
@@ -337,6 +343,7 @@ def train_one_epoch(
             writer.add_scalar('train/loss', loss.item(), step)
             writer.add_scalar('train/lr', last_lr, step)
             writer.add_scalar('train/psnr', batch_psnr, step)
+            writer.add_scalar('train/render_psnr', batch_render_psnr, step)
             writer.add_scalar('train/ssim', batch_ssim, step)
 
         for key, value in losses.items():
@@ -350,6 +357,7 @@ def train_one_epoch(
             iterator.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'psnr': f"{batch_psnr:.2f}",
+                'r_psnr': f"{batch_render_psnr:.2f}",
                 'ssim': f"{batch_ssim:.4f}",
                 'lr': f"{last_lr:.2e}",
             })

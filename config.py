@@ -147,6 +147,13 @@ class LossConfig:
     w_ssim: float = 1.0    # SSIM loss - INCREASED from 0.2 (target metric!)
     w_lap: float = 0.1     # Laplacian pyramid - DECREASED from 0.5 (reduce over-smoothing)
 
+    # Deep supervision on the COARSE Gaussian render (vs target at t), applied with a
+    # fixed weight OUTSIDE the uncertainty weighting (like LPIPS). Moderate so the
+    # dominant photometric term stays on the refined `pred`; this keeps the 3D field
+    # itself producing the interpolated frame (the U-Net stays a refiner). Plan Phase 2.
+    w_render_l1: float = 0.5
+    w_render_ssim: float = 0.5
+
     # Perceptual (DISABLED for pure PSNR/SSIM - conflicts with mathematical metrics)
     w_lpips: float = 0.0   # DISABLED - perceptual loss fights against PSNR/SSIM
     use_lpips: bool = False
