@@ -203,6 +203,13 @@ class GSMambaConfig:
     # Gaussian prediction head
     gaussian_channels: int = 14  # depth(1), depth_scale(1), xy_offset(2), scale_xy(2), rotation(4), color(3), opacity(1)
 
+    # Phase 3 (flag-gated, default OFF): predict a per-Gaussian 3D velocity and use it to
+    # advect each bounding frame's Gaussians to the query time t, then merge both warped
+    # clouds (correspondence-free forward warp; rasterizer composites by depth). Handles
+    # object motion / rotation / disocclusion. Bootstrapped by gflow + render supervision.
+    # Default False -> exact pre-Phase-3 synthesis (checkpoint-compatible).
+    predict_motion: bool = False
+
     # Renderer
     sh_degree: int = 0  # Start simple, can increase
     default_fov: float = 0.8  # ~45 degrees

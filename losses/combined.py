@@ -238,9 +238,15 @@ class GSMambaLoss(nn.Module):
 
         # ========== Geometric Losses ==========
         raw_losses['depth'] = self.depth_loss(depth, pred)
-        raw_losses['temporal'] = self.temporal_loss(
-            gaussians_list, gaussians_interp, t
-        ) if len(gaussians_list) > 0 else torch.tensor(0.0, device=device)
+        # temporal_loss compares the interpolated cloud against a per-point linear path,
+        # which needs matching point counts. The motion-synthesis path (predict_motion)
+        # merges two forward-warped clouds (2x points), so skip it there.
+        _interp_xyz = gaussians_interp.get('xyz') if isinstance(gaussians_interp, dict) else None
+        if (len(gaussians_list) > 0 and _interp_xyz is not None
+                and _interp_xyz.shape[1] == gaussians_list[0]['xyz'].shape[1]):
+            raw_losses['temporal'] = self.temporal_loss(gaussians_list, gaussians_interp, t)
+        else:
+            raw_losses['temporal'] = torch.tensor(0.0, device=device)
 
         # ========== Gaussian Flow Loss ==========
         # Note: gflow has its own decay schedule, compute raw loss here

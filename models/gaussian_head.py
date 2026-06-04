@@ -50,6 +50,10 @@ class GaussianHead(nn.Module):
 
     OUT_CHANNELS = 14
 
+    # Optional per-Gaussian 3D motion (velocity), appended when predict_motion=True.
+    VELOCITY_START = 14
+    VELOCITY_END = 17
+
     def __init__(
             self,
             in_channels: int,
@@ -57,14 +61,17 @@ class GaussianHead(nn.Module):
             init_depth: float = 1.0,
             init_scale: float = 0.01,
             init_opacity: float = -2.0,
+            predict_motion: bool = False,
     ):
         super().__init__()
 
         hidden_channels = hidden_channels or in_channels
+        self.predict_motion = predict_motion
+        out_channels = self.OUT_CHANNELS + (3 if predict_motion else 0)
 
         self.conv1 = nn.Conv2d(in_channels, hidden_channels, 3, 1, 1)
         self.act = nn.GELU()
-        self.conv2 = nn.Conv2d(hidden_channels, self.OUT_CHANNELS, 1)
+        self.conv2 = nn.Conv2d(hidden_channels, out_channels, 1)
 
         # Initialize biases for stable training
         self._init_biases(init_depth, init_scale, init_opacity)
@@ -126,7 +133,7 @@ class GaussianHead(nn.Module):
         color = torch.sigmoid(out[:, self.COLOR_START:self.COLOR_END])
         opacity = torch.sigmoid(out[:, self.OPACITY_IDX:self.OPACITY_IDX+1])
 
-        return {
+        params = {
             'depth': depth,
             'depth_scale': depth_scale,
             'xy_offset': xy_offset,
@@ -135,6 +142,13 @@ class GaussianHead(nn.Module):
             'color': color,
             'opacity': opacity,
         }
+
+        if self.predict_motion:
+            # Per-Gaussian 3D velocity (linear, same space as xyz). Bias-init 0 so
+            # synthesis starts motion-free and learns motion from photometric + gflow.
+            params['velocity'] = out[:, self.VELOCITY_START:self.VELOCITY_END]
+
+        return params
 
 
 class MultiScaleGaussianHead(nn.Module):
@@ -155,6 +169,7 @@ class MultiScaleGaussianHead(nn.Module):
             in_channels_list: List[int],
             out_resolution: Tuple[int, int] = (256, 256),
             fusion_channels: int = 64,
+            predict_motion: bool = False,
     ):
         super().__init__()
 
@@ -174,7 +189,7 @@ class MultiScaleGaussianHead(nn.Module):
             nn.GELU(),
         )
 
-        self.head = GaussianHead(fusion_channels)
+        self.head = GaussianHead(fusion_channels, predict_motion=predict_motion)
 
     def forward(self, multi_scale_features: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -319,10 +334,16 @@ class GaussianAssembler(nn.Module):
         opacity = gaussian_params['opacity'].view(B, 1, -1).permute(0, 2, 1)  # (B, N, 1)
         color = gaussian_params['color'].view(B, 3, -1).permute(0, 2, 1)  # (B, N, 3)
 
-        return {
+        out = {
             'xyz': xyz,
             'scale': scale,
             'rotation': rotation,
             'opacity': opacity,
             'color': color,
         }
+
+        # Optional per-Gaussian 3D velocity (motion synthesis). Same (B, N, 3) layout.
+        if 'velocity' in gaussian_params:
+            out['velocity'] = gaussian_params['velocity'].view(B, 3, -1).permute(0, 2, 1)
+
+        return out

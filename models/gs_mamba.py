@@ -74,6 +74,7 @@ class GSMamba(nn.Module):
             in_channels_list=config.embed_dims,
             out_resolution=config.image_size,
             fusion_channels=config.embed_dims[0] * 2,
+            predict_motion=getattr(config, 'predict_motion', False),
         )
 
         # 4. Gaussian Assembler (2D predictions -> 3D Gaussians)
