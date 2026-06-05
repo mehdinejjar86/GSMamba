@@ -223,6 +223,7 @@ def create_train_loader(
             num_workers=num_workers,
             collate_fn=x4k_collate,
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
         )
 
     elif mode == "mixed":
@@ -252,7 +253,7 @@ def create_train_loader(
         x4k_group_sizes = []
         for n in x4k_n_values:
             indices = x4k.get_samples_with_n(n)
-            if not indices:
+            if len(indices) == 0:   # numpy index array -> use len(), not truthiness
                 continue
             subset = Subset(x4k, indices)
             x4k_subsets.append(subset)
@@ -305,6 +306,7 @@ def create_train_loader(
             num_workers=num_workers,
             collate_fn=mixed_collate,
             pin_memory=True,
+            persistent_workers=(num_workers > 0),
         )
 
     else:

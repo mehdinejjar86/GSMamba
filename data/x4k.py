@@ -98,12 +98,16 @@ class X4K1000Dataset(data.Dataset):
         # For backward compatibility: single n_frames for datasets with uniform N
         self.n_frames = self.n_frames_list[0] if len(set(self.n_frames_list)) == 1 else None
 
-        # Scan all sequences
-        self.sequences = self._scan_sequences()
+        # Scan all sequences. Store as a numpy string array (NOT a Python list): a list
+        # of strings gets duplicated into every forked DataLoader worker via refcount
+        # page writes (copy-on-write breakage). A numpy array has no per-element Python
+        # objects, so forked workers share it read-only.
+        _seqs = self._scan_sequences()
+        self.sequences = np.asarray(_seqs) if _seqs else np.empty((0,), dtype='<U1')
         if _is_main_process():
             print(f"[X4K {split}] Found {len(self.sequences)} sequences")
 
-        # Generate (sequence_idx, target_idx, anchors, n_frames) tuples
+        # Compact, COW-safe sample index (numpy int matrix; see _generate_samples).
         self.samples = self._generate_samples()
 
         # Group samples by n_frames for efficient batch sampling
@@ -188,9 +192,11 @@ class X4K1000Dataset(data.Dataset):
                         if i not in anchor_set
                     ]
 
-                    # Generate sample for each target
+                    # Generate sample for each target. Store the compact form
+                    # (seq_idx, target_frame, window_start, spacing, n_frames); anchors
+                    # are an arithmetic sequence reconstructed in __getitem__.
                     for target_frame in valid_targets:
-                        all_samples.append((seq_idx, target_frame, anchors, n_frames))
+                        all_samples.append((seq_idx, target_frame, window_start, spacing, n_frames))
                         step_samples += 1
 
             targets_per_window = window_span - 1 - (n_frames - 2)  # span - 1 minus interior anchors
@@ -198,16 +204,21 @@ class X4K1000Dataset(data.Dataset):
                 print(f"  STEP={step}, N={n_frames}: {num_windows} windows × "
                       f"{targets_per_window} targets × {len(self.sequences)} seqs = {step_samples} samples")
 
-        return all_samples
+        # Convert to a compact numpy int matrix (M, 5). This is the key fix for the X4K
+        # host-RAM explosion: millions of Python tuples would otherwise be copy-on-write
+        # duplicated across every (rank × num_workers) DataLoader worker.
+        if not all_samples:
+            return np.empty((0, 5), dtype=np.int64)
+        return np.asarray(all_samples, dtype=np.int64)
 
     def _index_by_n_frames(self):
-        """Index samples by n_frames for efficient batch sampling with same N."""
+        """Index samples by n_frames (numpy index arrays — COW-safe across workers)."""
+        # n_frames is column 4 of the compact (M, 5) sample matrix.
         self.samples_by_n = {}
-        for idx, sample in enumerate(self.samples):
-            n_frames = sample[3]
-            if n_frames not in self.samples_by_n:
-                self.samples_by_n[n_frames] = []
-            self.samples_by_n[n_frames].append(idx)
+        if len(self.samples) > 0:
+            n_col = self.samples[:, 4]
+            for n in np.unique(n_col):
+                self.samples_by_n[int(n)] = np.where(n_col == n)[0]
 
         # Print distribution
         if _is_main_process():
@@ -267,8 +278,9 @@ class X4K1000Dataset(data.Dataset):
             target_time: scalar, normalized position of target
             target: [3, H, W] target frame
         """
-        seq_idx, target_frame, anchors, n_frames = self.samples[idx]
-        seq_path = self.sequences[seq_idx]
+        seq_idx, target_frame, window_start, spacing, n_frames = (int(v) for v in self.samples[idx])
+        anchors = [window_start + i * spacing for i in range(n_frames)]
+        seq_path = str(self.sequences[seq_idx])
 
         # Load anchors + target
         all_indices = anchors + [target_frame]
