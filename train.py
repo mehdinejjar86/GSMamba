@@ -705,6 +705,8 @@ def main():
                              'Must be paired with --x4k-steps.')
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--crop_size', type=int, default=None)
+    parser.add_argument('--x4k-crop-size', dest='x4k_crop_size', type=int, default=None,
+                        help='Spatial crop for X4K frames (default: dataset native ~768); set smaller to fit GPU memory')
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--full-coverage-mixed', dest='full_coverage_mixed',
                         action='store_true', default=None,
