@@ -1,85 +1,123 @@
 # GS-Mamba
 
-N-Frame Video Frame Interpolation via 3D Gaussian Splatting + Mamba
+**N-frame Video Frame Interpolation via 3D Gaussian Splatting + Mamba.**
 
 ## Overview
 
-GS-Mamba lifts N consecutive video frames to 3D Gaussian representations and uses Mamba (Selective State Space Models) for temporal interpolation. Unlike traditional 2-frame VFI methods that rely on 2D optical flow, GS-Mamba:
+GS-Mamba is a *novel-synthesis* approach to VFI. Instead of warping with 2D optical flow, it lifts each of N input frames into a **per-pixel 3D Gaussian** cloud, reasons across frames with a **Mamba** state-space model *in the 3D-Gaussian domain*, renders the in-between frame with a differentiable splat renderer, and refines it with a 2D U-Net. The camera is fixed (this is VFI, not novel-view synthesis) — the 3D representation exists to model **object motion, rotation, and self-occlusion** that 2D-flow methods struggle with.
 
-- Handles **variable N input frames** (N=2, 3, 4, ...)
-- Naturally handles **occlusion** via 3D representation
-- Captures **non-linear motion** through learned residuals
+- **Variable N input frames** (N = 2, 3, 4, …), trained via a curriculum (Vimeo → X4K → mixed).
+- **Occlusion / disocclusion** handled by depth-compositing the splats.
+- **Optional motion synthesis** (`--predict-motion`): each Gaussian predicts its own velocity (and rotation/acceleration), is forward-warped to the query time, and the warped clouds are merged — the mechanism that targets rotating/zooming objects.
+- The U-Net refiner is kept at full strength (PSNR/SSIM objective); the coarse render is also deep-supervised so the 3D field carries the synthesis rather than leaning entirely on the U-Net.
 
 ## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
+Training expects CUDA with `diff_gaussian_rasterization` and `mamba_ssm`; both gracefully fall back to slower reference paths when unavailable (e.g. CPU/MPS for smoke tests).
+
+## Quick check
+
+```bash
+python smoke_tests.py --datasets none     # builds the model + runs fwd/bwd, incl. the motion path
+```
 
 ## Training
 
-### Single GPU (Vimeo-90K)
-```bash
-python -m gsmamba.train --exp_name my_exp --vimeo_root /path/to/vimeo_triplet
-```
+Entry point is `train.py` (single GPU, or multi-GPU via `torchrun`).
 
-### Multi-GPU (DDP)
+**Vimeo-90K, single GPU**
 ```bash
-torchrun --nproc_per_node=4 -m gsmamba.train \
-    --exp_name my_exp \
+python train.py --mode vimeo_only --exp_name my_exp \
     --vimeo_root /path/to/vimeo_triplet
 ```
 
-### X4K with Variable N-Frames (TEMPO-style)
+**Multi-GPU (DDP), full curriculum**
 ```bash
-python -m gsmamba.train --mode x4k_only \
-    --x4k_root /path/to/x4k \
-    --x4k-steps 7 15 31 \
-    --x4k-n-frames 4 3 2 \
-    --no_curriculum
+torchrun --nproc_per_node=4 train.py \
+    --exp_name my_exp --use_curriculum \
+    --vimeo_root /path/to/vimeo_triplet \
+    --x4k_root /path/to/X4K --x4k_test_root /path/to/X4K/test \
+    --flow_ckpt /path/to/VFIMamba_S.pkl --flow_model_size S
 ```
 
-The `--x4k-steps` and `--x4k-n-frames` are paired:
-- step=7, n_frames=4 → anchor spacing of 8 frames, use 4 anchors
-- step=15, n_frames=3 → anchor spacing of 16 frames, use 3 anchors
-- step=31, n_frames=2 → anchor spacing of 32 frames, use 2 anchors
+**X4K with variable N (TEMPO-style)**
+```bash
+python train.py --mode x4k_only --no_curriculum \
+    --x4k_root /path/to/X4K --x4k-steps 7 15 31 --x4k-n-frames 4 3 2
+```
+`--x4k-steps` and `--x4k-n-frames` are paired (e.g. step=7,N=4 → anchor spacing 8 with 4 anchors).
 
-### Key Training Arguments
+**Motion synthesis (the novel path — opt-in)**
+```bash
+python train.py --mode vimeo_only --exp_name motion \
+    --predict-motion --gaussian-feat-dim 32 --refine-real-coverage \
+    --vimeo_root /path/to/vimeo_triplet
+```
+Default (no `--predict-motion`) = the per-frame lift + 2-frame blend baseline.
+
+**Baseline-vs-motion A/B** — two matched runs that differ *only* in the motion flags:
+```bash
+# edit the vars at the top of the script, then run as two jobs:
+bash run_ab.sh base      # control
+bash run_ab.sh motion    # novel synthesis
+```
+
+### Key arguments
 
 | Argument | Description |
-|----------|-------------|
-| `--exp_name` | Experiment name (creates output folder) |
+|---|---|
 | `--mode` | `vimeo_only`, `x4k_only`, or `mixed` |
-| `--batch_size` | Batch size per GPU |
-| `--epochs` | Number of training epochs |
-| `--lr` | Learning rate |
-| `--use_amp` / `--no_amp` | Enable/disable mixed precision |
-| `--use_curriculum` / `--no_curriculum` | Enable/disable curriculum learning |
-| `--eval_full_every` | Run full benchmark every N epochs |
+| `--use_curriculum` / `--no_curriculum` | curriculum (Vimeo → X4K N=4/3/2 → mixed) |
+| `--batch_size`, `--epochs`, `--lr` | optimization |
+| `--crop_size` / `--x4k-crop-size` | Vimeo / X4K spatial crop (memory lever) |
+| `--use_amp` / `--no_amp` | mixed precision |
+| `--flow_ckpt`, `--flow_model_size` | VFIMamba flow teacher for the gflow loss (training only) |
+| `--predict-motion` | enable 3D-Gaussian motion synthesis |
+| `--gaussian-feat-dim` | per-Gaussian latent width mixed in 3D (motion) |
+| `--motion-accel` | also predict per-Gaussian acceleration (quadratic path) |
+| `--motion-frames-k` | frames to advect+merge at t (`0` = all N; set e.g. `2` to cap memory) |
+| `--motion-temporal-tau` | temporal opacity-weight softness (`≤0` → uniform) |
+| `--refine-real-coverage` | feed the refiner a rendered coverage/alpha map |
+| `--x4k_fraction` | fraction of X4K samples per epoch |
+| `--eval_full_every` | run the full benchmark every N epochs |
+| `--resume` | resume from a checkpoint |
 
 ## Evaluation
 
 ```bash
-python -m gsmamba.eval \
-    --checkpoint outputs/my_exp/best.pth \
-    --dataset all \
-    --vimeo_root /path/to/vimeo_triplet \
-    --x4k_root /path/to/x4k/test
+python eval.py --checkpoint outputs/my_exp/best.pth --dataset all \
+    --vimeo_root /path/to/vimeo_triplet --x4k_root /path/to/X4K/test
 ```
-
-Datasets: `vimeo`, `x4k`, `all`
+`eval.py` rebuilds the exact architecture from the checkpoint's saved config, so motion/feature flags don't need to be re-passed. Datasets: `vimeo`, `x4k`, `all`.
 
 ## Architecture
 
 ```
-N Frames → SS2D Encoder → Temporal Mamba Fusion → Per-Frame Gaussians
-                                ↓
-Query timestep t → Gaussian Interpolator → Differentiable Rendering → Refinement → Output
+N frames ─► SS2D encoder (per-frame, shared weights)
+            └─► per-Gaussian head: 14 params  [+ F-dim latent when --predict-motion]
+                 └─► 3D Gaussians per frame
+                      └─► NFrameGaussianMamba — JOINT 3D-Morton ordering across frames
+                          + bidirectional SSM (cross-frame reasoning in Gaussian space)
+                          ├─ default: pick the two bounding frames → blend at t
+                          └─ motion : per-Gaussian velocity/rotation → forward-warp every
+                                      (or K nearest) frame to t → merge (depth-composited)
+                               └─► differentiable splat render ─► U-Net refine ─► output
 ```
 
-## Loss Functions
+The VFIMamba flow network is a **training-only teacher** for the Gaussian-Flow loss; it is not used at inference (the model predicts its own motion).
 
-- **Photometric**: L1, SSIM, Laplacian pyramid
-- **Gaussian Flow**: 2D flow supervision (decays during training)
-- **Regularization**: Depth smoothness, temporal consistency, opacity/scale
-- **Uncertainty weighting**: Learns optimal loss weights automatically (Kendall et al.)
+## Losses
+
+- **Photometric** on the refined output: L1 + SSIM + Laplacian pyramid.
+- **Coarse-render deep supervision**: L1/SSIM on the pre-refine render, so the Gaussian field itself produces the interpolated frame.
+- **Gaussian-Flow (gflow)**: frozen VFIMamba flow supervises motion early, then decays out (training only).
+- **Regularization**: depth smoothness, opacity/scale.
+- **Uncertainty weighting** (Kendall et al.) to balance the terms automatically.
+
+## Notes on memory / scale
+
+- X4K's sample index (millions of samples) is stored as a compact numpy array, so multi-worker DDP DataLoaders don't blow up host RAM via copy-on-write.
+- For tight GPU memory at native X4K resolution, use `--x4k-crop-size` and/or `--motion-frames-k 2`.
